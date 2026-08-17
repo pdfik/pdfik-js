@@ -1,0 +1,44 @@
+{
+  "name": "@pdfik/client",
+  "version": "0.2.2",
+  "description": "Official TypeScript SDK for the PDFik PDF generation API",
+  "homepage": "https://pdfik.net",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pdfik/pdfik-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pdfik/pdfik-js/issues",
+    "email": "support@pdfik.net"
+  },
+  "license": "MIT",
+  "keywords": ["pdf", "html-to-pdf", "url-to-pdf", "api", "pdfik"],
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "test": "jest",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "ts-jest": "^29.0.0"
+  },
+  "files": ["dist", "README.md"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}
