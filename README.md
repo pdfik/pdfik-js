@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-08-17).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-06).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -14,6 +14,7 @@ Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed w
 - **Zero Runtime Dependencies**: Uses native `fetch` (Node 18+, browsers, Edge).
 - **Auto Retry**: Automatic exponential backoff for `5xx` and `429` (Rate Limit) errors.
 - **DX Affordances**: Built-in polling logic (`waitForJob`) and binary download helpers.
+- **E-invoicing**: Factur-X / ZUGFeRD hybrid PDF/A-3 output — generated from your CII XML alone (`einvoiceToPdf`) or attached to your own render (the `einvoice` option).
 
 ## Installation
 
@@ -106,6 +107,57 @@ console.log(result.expiresAt); // e.g. "2026-08-05T12:00:00Z"
 const pdfBytes = await client.downloadPdf(job.jobId); // sample PDF
 ```
 
+## E-invoicing (Factur-X / ZUGFeRD)
+
+PDFik can produce hybrid e-invoices: a normal, human-readable PDF that also embeds your UN/CEFACT Cross-Industry-Invoice (CII) XML as `factur-x.xml`, normalized to PDF/A-3. Outputs are validated with veraPDF and Mustangproject. Available on every plan;
+
+> Schema-valid does not mean tax-compliant — the invoice content is the caller's responsibility. The `minimum` and `basicwl` profiles carry accompanying data only and are NOT a legally sufficient e-invoice in DE/FR.
+
+### Generate the PDF from the XML (`einvoiceToPdf`)
+
+Send just the XML; PDFik builds the human-readable invoice from a block template (design one on the dashboard E-Invoice page, or pass an inline definition):
+
+```typescript
+import { readFileSync } from 'fs';
+
+const xml = readFileSync('invoice.xml', 'utf8'); // UN/CEFACT CII XML, UTF-8, up to 1 MB
+
+const job = await client.einvoiceToPdf(xml, {
+  profile: 'en16931',         // 'minimum' | 'basicwl' | 'basic' | 'en16931' | 'extended' (default 'en16931')
+  templateId: '550e8400-...', // optional saved template; omit to use your account default
+  webhookUrl: 'https://yourserver.com/webhooks/pdf',
+});
+
+await client.waitForJob(job.jobId);
+const pdfBytes = await client.downloadPdf(job.jobId);
+```
+
+`templateId` and `template` (an inline block-template definition — the same JSON the dashboard editor produces) are mutually exclusive; omit both to use your account's default template. The XML is validated against the official XSD of the declared `profile` before any quota is spent, and the XML's guideline parameter must match the profile. Invoices (TypeCode 380) and credit notes (381) are supported.
+
+### Attach the XML to your own rendering (the `einvoice` option)
+
+If you already render the visual invoice yourself, pass `einvoice` to `urlToPdf` / `htmlToPdf` — the rendered page becomes the visual half and the output is normalized to PDF/A-3 with the XML embedded:
+
+```typescript
+const job = await client.htmlToPdf(invoiceHtml, {
+  einvoice: {
+    format: 'factur-x', // only value in v1 (may be omitted)
+    profile: 'en16931',
+    xml,
+  },
+});
+```
+
+The `einvoice` option is mutually exclusive with `options.userPassword` (PDF/A forbids encryption) and `options.compression` (re-saving breaks the PDF/A attributes).
+
+### E-invoicing error codes
+
+- `422` [einvoice-xml-invalid](https://docs.pdfik.net/error-codes#einvoice-xml-invalid) — the XML failed XSD validation or does not match the declared profile.
+- `422` [einvoice-options-conflict](https://docs.pdfik.net/error-codes#einvoice-options-conflict) — `einvoice` combined with `userPassword`/`compression`, or `templateId` combined with `template`.
+- `404` [einvoice-template-not-found](https://docs.pdfik.net/error-codes#einvoice-template-not-found) — unknown `templateId` for this account.
+- `413` [payload-too-large-for-queue](https://docs.pdfik.net/error-codes#payload-too-large-for-queue) — the XML does not fit the job queue even compressed.
+- A job that fails during rendering reports `errorCode: 'EINVOICE_FAILED'` in the job status.
+
 ## Limits, retention and error codes
 
 - **Generated volume per month** (byte quota, counts rendered output only — downloads are free): Free 0.5 GB, Starter 10 GB, Pro 50 GB, Business 300 GB. Business plans can purchase additional +1 GB blocks from the dashboard. Exceeding the quota returns `429` ([quota-bytes-exceeded](https://docs.pdfik.net/error-codes#quota-bytes-exceeded)).
@@ -172,6 +224,7 @@ constructor(config: { apiKey: string; baseUrl?: string })
 
 - **`urlToPdf(url, opts)`**: Submits a job to convert a public URL to a PDF. Returns a `JobCreatedResponse`.
 - **`htmlToPdf(html, opts)`**: Submits a job to convert raw HTML markup to a PDF. Returns a `JobCreatedResponse`.
+- **`einvoiceToPdf(xml, opts)`**: Submits a Factur-X e-invoice job — builds the human-readable invoice from your CII XML with a block template, renders to PDF/A-3 and embeds the XML as `factur-x.xml`. Returns a `JobCreatedResponse`.
 - **`getJob(jobId)`**: Fetches the status of a specific job. Returns a `JobStatusResponse`.
 - **`waitForJob(jobId, opts)`**: Helper that polls `getJob` until the job is `done` or `failed`. Throws a `PdfikError` if the job fails or times out.
   - `opts.timeoutMs` (default: `120000` ms)

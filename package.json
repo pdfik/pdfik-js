@@ -1,6 +1,6 @@
 {
   "name": "@pdfik/client",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Official TypeScript SDK for the PDFik PDF generation API",
   "homepage": "https://pdfik.net",
   "repository": {

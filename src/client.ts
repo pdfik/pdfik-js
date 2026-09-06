@@ -7,6 +7,8 @@ import {
   PdfOptions,
   RenderOptions,
   JobAuthOptions,
+  EInvoiceOptions,
+  EInvoiceProfile,
 } from './types';
 
 function snakeToCamel(str: string): string {
@@ -95,8 +97,12 @@ export class PdfikClient {
             if (data.detail) {
               message = data.detail;
             }
-            if (data.error_code) {
-              errorCode = data.error_code;
+            // pdf-api's RFC 7807 bodies carry the code in `error`
+            // (QUOTA_EXCEEDED, EINVOICE_XML_INVALID, …); `error_code` is kept
+            // as a fallback for any body that still uses it.
+            const code = data.error ?? data.error_code;
+            if (typeof code === 'string' && code) {
+              errorCode = code;
             }
           }
         } catch {
@@ -141,10 +147,16 @@ export class PdfikClient {
    * the download returns a sample PDF. Quotas are not debited — test jobs
    * are free and rate-limited instead (60/min, 2,000/day). Job
    * status and webhook payloads always carry `test: true|false`.
+   *
+   * Pass `opts.einvoice` to turn the render into a Factur-X hybrid e-invoice:
+   * the rendered page becomes the visual half, the output is normalized to
+   * PDF/A-3 and the XML is embedded as `factur-x.xml`. Mutually exclusive
+   * with `options.userPassword` (PDF/A forbids encryption) and
+   * `options.compression` (re-saving breaks the PDF/A attributes).
    */
   async urlToPdf(
     url: string,
-    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; auth?: JobAuthOptions; idempotencyKey?: string; test?: boolean }
+    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; auth?: JobAuthOptions; einvoice?: EInvoiceOptions; idempotencyKey?: string; test?: boolean }
   ): Promise<JobCreatedResponse> {
     validateRenderOptions(opts?.render);
     const body = {
@@ -153,6 +165,7 @@ export class PdfikClient {
       options: opts?.options,
       render: opts?.render,
       auth: opts?.auth,
+      einvoice: opts?.einvoice,
       test: opts?.test,
     };
     const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
@@ -169,10 +182,16 @@ export class PdfikClient {
    * the download returns a sample PDF. Quotas are not debited — test jobs
    * are free and rate-limited instead (60/min, 2,000/day). Job
    * status and webhook payloads always carry `test: true|false`.
+   *
+   * Pass `opts.einvoice` to turn the render into a Factur-X hybrid e-invoice:
+   * the rendered page becomes the visual half, the output is normalized to
+   * PDF/A-3 and the XML is embedded as `factur-x.xml`. Mutually exclusive
+   * with `options.userPassword` (PDF/A forbids encryption) and
+   * `options.compression` (re-saving breaks the PDF/A attributes).
    */
   async htmlToPdf(
     html: string,
-    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; idempotencyKey?: string; test?: boolean }
+    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; einvoice?: EInvoiceOptions; idempotencyKey?: string; test?: boolean }
   ): Promise<JobCreatedResponse> {
     validateRenderOptions(opts?.render);
     const body = {
@@ -180,10 +199,45 @@ export class PdfikClient {
       webhookUrl: opts?.webhookUrl,
       options: opts?.options,
       render: opts?.render,
+      einvoice: opts?.einvoice,
       test: opts?.test,
     };
     const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
     const res = await this.request('/html-to-pdf', 'POST', body, extraHeaders);
+    const data = await res.json();
+    return mapKeys(data, snakeToCamel) as JobCreatedResponse;
+  }
+
+  /**
+   * Submits a Factur-X e-invoice job: builds a human-readable invoice from
+   * your UN/CEFACT Cross-Industry-Invoice XML using a block template, renders
+   * it to PDF/A-3 and embeds the XML as `factur-x.xml` (Factur-X / ZUGFeRD
+   * hybrid). Then poll with `waitForJob` and fetch via `downloadPdf` as usual.
+   *
+   * The XML is validated against the official XSD of the declared `profile`
+   * before any quota is spent. Schema-valid does not mean tax-compliant —
+   * the invoice content is the caller's responsibility. On the Free plan the
+   * generated PDF carries a PDFik.net watermark.
+   *
+   * `opts.templateId` (a template saved on the dashboard E-Invoice page) and
+   * `opts.template` (an inline block-template definition, the same JSON the
+   * dashboard editor produces) are mutually exclusive; omit both to use your
+   * account's default template.
+   */
+  async einvoiceToPdf(
+    xml: string,
+    opts?: { profile?: EInvoiceProfile; templateId?: string; template?: Record<string, unknown>; webhookUrl?: string; idempotencyKey?: string; test?: boolean }
+  ): Promise<JobCreatedResponse> {
+    const body = {
+      xml,
+      profile: opts?.profile,
+      templateId: opts?.templateId,
+      template: opts?.template,
+      webhookUrl: opts?.webhookUrl,
+      test: opts?.test,
+    };
+    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
+    const res = await this.request('/einvoice-to-pdf', 'POST', body, extraHeaders);
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }

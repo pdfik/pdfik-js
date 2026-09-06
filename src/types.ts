@@ -1,4 +1,6 @@
-export type PaperFormat = 'A4' | 'A3' | 'Letter' | 'Legal' | 'Tabloid';
+export type PaperFormat =
+  | 'A0' | 'A1' | 'A2' | 'A3' | 'A4' | 'A5' | 'A6'
+  | 'Letter' | 'Legal' | 'Tabloid' | 'Ledger';
 export type WaitUntilEvent = 'load' | 'domcontentloaded' | 'networkidle' | 'commit';
 export type JobStatus = 'queued' | 'rendering' | 'uploading' | 'done' | 'failed';
 
@@ -46,6 +48,25 @@ export interface RenderOptions {
 export interface JobAuthOptions {
   type: 'basic' | 'bearer';
   value: string;
+}
+
+export type EInvoiceProfile = 'minimum' | 'basicwl' | 'basic' | 'en16931' | 'extended';
+
+export interface EInvoiceOptions {
+  /** E-invoice container format. Only 'factur-x' in v1 (may be omitted). */
+  format?: 'factur-x';
+  /**
+   * Factur-X conformance profile the XML declares (default: 'en16931').
+   * 'basic', 'en16931' and 'extended' carry a complete legal invoice;
+   * 'minimum' and 'basicwl' are accompanying data only and are NOT a legally
+   * sufficient e-invoice in DE/FR.
+   */
+  profile?: EInvoiceProfile;
+  /**
+   * UN/CEFACT Cross-Industry-Invoice XML (the Factur-X payload), UTF-8, up to
+   * 1 MB. Validated against the official XSD of the declared profile.
+   */
+  xml: string;
 }
 
 export interface JobCreatedResponse {
