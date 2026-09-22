@@ -91,6 +91,220 @@ describe('PdfikClient', () => {
     });
   });
 
+  test('markdownToPdf sends correct request', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-md-1',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    const response = await client.markdownToPdf('# Invoice\n\nHello **world**', {
+      webhookUrl: 'https://webhook.com',
+      options: { format: 'A4', printBackground: true },
+    });
+
+    expect(response).toEqual({
+      jobId: 'job-md-1',
+      status: 'queued',
+      detail: 'Job queued',
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith('https://api.pdfik.net/markdown-to-pdf', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'sk_test_123',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        markdown: '# Invoice\n\nHello **world**',
+        webhook_url: 'https://webhook.com',
+        options: { format: 'A4', print_background: true },
+      }),
+    });
+  });
+
+  test('markdownToPdf sends the test flag and the Idempotency-Key header', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-md-2',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    await client.markdownToPdf('# Hi', { test: true, idempotencyKey: 'md-key-1' });
+
+    expect(mockFetch).toHaveBeenCalledWith('https://api.pdfik.net/markdown-to-pdf', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': 'md-key-1',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ markdown: '# Hi', test: true }),
+    });
+  });
+
+  test('urlToImage sends snake_case full_page and viewport keys', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-img-1',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    const response = await client.urlToImage('https://example.com', {
+      options: {
+        format: 'jpeg',
+        fullPage: false,
+        quality: 80,
+        viewport: { width: 1280, height: 720 },
+      },
+    });
+
+    expect(response).toEqual({
+      jobId: 'job-img-1',
+      status: 'queued',
+      detail: 'Job queued',
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith('https://api.pdfik.net/url-to-image', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'sk_test_123',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: 'https://example.com',
+        options: {
+          format: 'jpeg',
+          full_page: false,
+          quality: 80,
+          viewport: { width: 1280, height: 720 },
+        },
+      }),
+    });
+  });
+
+  test('urlToImage passes the auth block through', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-img-2',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    await client.urlToImage('https://intranet.example.com/report', {
+      auth: { type: 'bearer', value: 'tok-123' },
+    });
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(sent).toEqual({
+      url: 'https://intranet.example.com/report',
+      auth: { type: 'bearer', value: 'tok-123' },
+    });
+  });
+
+  test('htmlToImage sends correct request', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-img-3',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    const response = await client.htmlToImage('<h1>Hello</h1>', {
+      options: { fullPage: true },
+      test: true,
+    });
+
+    expect(response).toEqual({
+      jobId: 'job-img-3',
+      status: 'queued',
+      detail: 'Job queued',
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenCalledWith('https://api.pdfik.net/html-to-image', {
+      method: 'POST',
+      headers: {
+        'X-API-Key': 'sk_test_123',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        html: '<h1>Hello</h1>',
+        options: { full_page: true },
+        test: true,
+      }),
+    });
+  });
+
+  test('delivery option is sent with an explicit presigned_put mode', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-byob-1',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    const presignedUrl = 'https://bucket.s3.eu-central-1.amazonaws.com/report.pdf?X-Amz-Signature=abc';
+    // `mode` omitted by the caller: the client must spell it out on the wire.
+    await client.urlToPdf('https://example.com', {
+      delivery: { url: presignedUrl },
+    });
+
+    const rawBody = mockFetch.mock.calls[0][1].body as string;
+    expect(rawBody).toContain(
+      `"delivery":{"mode":"presigned_put","url":${JSON.stringify(presignedUrl)}}`
+    );
+    expect(JSON.parse(rawBody)).toEqual({
+      url: 'https://example.com',
+      delivery: { mode: 'presigned_put', url: presignedUrl },
+    });
+  });
+
+  test('every job-creating method accepts delivery', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        job_id: 'job-byob-2',
+        status: 'queued',
+        detail: 'Job queued',
+      }),
+    });
+
+    const delivery = { mode: 'presigned_put' as const, url: 'https://bucket.example.com/out?sig=1' };
+    await client.htmlToPdf('<h1>Hi</h1>', { delivery });
+    await client.markdownToPdf('# Hi', { delivery });
+    await client.urlToImage('https://example.com', { delivery });
+    await client.htmlToImage('<h1>Hi</h1>', { delivery });
+    await client.einvoiceToPdf('<rsm:CrossIndustryInvoice/>', { delivery });
+
+    expect(mockFetch).toHaveBeenCalledTimes(5);
+    for (const call of mockFetch.mock.calls) {
+      const sent = JSON.parse(call[1].body);
+      expect(sent.delivery).toEqual({ mode: 'presigned_put', url: 'https://bucket.example.com/out?sig=1' });
+    }
+  });
+
   test('urlToPdf with einvoice option sends the factur-x block', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
     mockFetch.mockResolvedValueOnce({
@@ -407,6 +621,24 @@ describe('PdfikClient', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  test('422 validation error: detail list becomes a readable message, not [object Object]', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 422,
+      text: async () => JSON.stringify({
+        type: 'https://docs.pdfik.net/error-codes#validation-error',
+        title: 'Unprocessable Entity - Request Validation Error',
+        status: 422,
+        detail: [{ loc: ['body', 'options', 'viewport', 'width'], msg: 'Input should be less than or equal to 1920', type: 'less_than_equal' }],
+      }),
+    });
+    await expect(client.urlToImage('https://example.com')).rejects.toMatchObject({
+      statusCode: 422,
+      message: 'options.viewport.width: Input should be less than or equal to 1920',
+    });
+  });
+
   test('waitForJob polls until done', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
 
@@ -430,6 +662,26 @@ describe('PdfikClient', () => {
     expect(result).toEqual({ status: 'done', pagesCount: 5 });
     expect(mockFetch).toHaveBeenCalledTimes(3);
   });
+
+  test('waitForJob waits out a 429 instead of failing', async () => {
+    // Free is 10 requests/min: a render longer than ~20 s used to end the wait
+    // with a 429 once the request-level retries (3) were spent.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    const throttled = {
+      ok: false,
+      status: 429,
+      text: async () => JSON.stringify({ error: 'RATE_LIMIT_EXCEEDED', detail: 'Too many requests. Please try again later.', retry_after_seconds: 0.01 }),
+    };
+    mockFetch
+      .mockResolvedValueOnce(throttled)
+      .mockResolvedValueOnce(throttled)
+      .mockResolvedValueOnce(throttled)
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'done' }) });
+
+    const result = await client.waitForJob('job-123', { pollIntervalMs: 1, timeoutMs: 60000 });
+    expect(result.status).toBe('done');
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  }, 15000);
 
   test('waitForJob rejects on failed status', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });

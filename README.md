@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-06).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-22).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -31,6 +31,7 @@ pnpm add @pdfik/client
 ### Convert public URL to PDF
 
 ```typescript
+import { writeFileSync } from 'fs';
 import { PdfikClient } from '@pdfik/client';
 
 // Initialize the client
@@ -60,8 +61,7 @@ async function generatePdf() {
     const pdfBytes = await client.downloadPdf(job.jobId);
     
     // Save to file (Node.js example)
-    const fs = require('fs');
-    fs.writeFileSync('output.pdf', pdfBytes);
+    writeFileSync('output.pdf', pdfBytes);
     console.log('PDF saved to output.pdf');
 
   } catch (error) {
@@ -106,6 +106,53 @@ console.log(result.expiresAt); // e.g. "2026-08-05T12:00:00Z"
 
 const pdfBytes = await client.downloadPdf(job.jobId); // sample PDF
 ```
+
+## Markdown to PDF
+
+`markdownToPdf` converts Markdown (CommonMark + GFM tables and strikethrough) with a built-in print stylesheet. Raw HTML inside the Markdown is escaped, not rendered — use `htmlToPdf` for full HTML control. The same `options` (paper format, margins, header/footer, watermark, ...) and job flow apply. The Markdown may be up to 100,000 characters (longer input is rejected with `422`); Markdown whose converted document is too large for the processing queue is rejected with `413` ([payload-too-large-for-queue](https://docs.pdfik.net/error-codes#payload-too-large-for-queue)) and is not charged. Example:
+
+```typescript
+const job = await client.markdownToPdf('# Report\n\n| Item | Price |\n| --- | --- |\n| Render | $0.01 |', {
+  options: { format: 'A4' },
+});
+await client.waitForJob(job.jobId);
+const pdfBytes = await client.downloadPdf(job.jobId);
+```
+
+## Screenshots
+
+`urlToImage` / `htmlToImage` capture a page as a PNG (default) or JPEG instead of a PDF. Options: `format` (`'png' | 'jpeg'`), `fullPage` (default `false` - the visible area only; with `true` the height follows the real page and is clipped at 8,192 px, which is a ceiling and not a target, so a 2,000 px page still gives a 2,000 px image, and horizontal overflow beyond the viewport width is never captured), `quality` (1-100, JPEG only) and `viewport` (`width`/`height`; you pick the window size and we capture exactly that - nothing is scaled or fitted - `width` 320-1920, `height` 320-8192, defaults to 1024x768). Polling is identical to the PDF endpoints, and `downloadPdf` returns the raw image bytes (`image/png` or `image/jpeg`, filename `{jobId}.png`/`.jpg`):
+
+```typescript
+const job = await client.urlToImage('https://example.com', {
+  options: {
+    format: 'jpeg',
+    quality: 80,
+    fullPage: true,
+    viewport: { width: 1280, height: 720 },
+  },
+});
+await client.waitForJob(job.jobId);
+const imageBytes = await client.downloadPdf(job.jobId); // JPEG bytes
+
+const htmlShot = await client.htmlToImage('<h1>Hello</h1>'); // 1024x768 PNG
+```
+
+`urlToImage` also accepts the Pro+ `auth` option (basic/bearer), exactly as `urlToPdf`. Passing `quality` together with PNG is rejected with `422`.
+
+## Deliver to your own bucket (BYOB)
+
+Pass `delivery` (Pro+, on every job-creating method) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
+
+```typescript
+const job = await client.urlToPdf('https://example.com', {
+  delivery: { url: presignedPutUrl }, // mode: 'presigned_put' is the only mode and may be omitted
+});
+
+await client.waitForJob(job.jobId); // 'done' means the PUT to your bucket succeeded
+```
+
+Once a delivered job is done, the `job.finished` webhook reports the outcome only: it carries neither `file_url` nor `expires_at`, because PDFik keeps no copy and never records where the file went (the presigned URL is a credential, so it is used once and forgotten). You already know the destination — you signed it. `downloadPdf` answers `404` ([output-delivered-externally](https://docs.pdfik.net/error-codes#output-delivered-externally)) — the file only exists in your bucket. `delivery` cannot be combined with `test: true` (`400`).
 
 ## E-invoicing (Factur-X / ZUGFeRD)
 
@@ -202,8 +249,10 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const event = JSON.parse(rawBody);
   console.log(`Webhook received for job: ${event.job_id}, status: ${event.status}`);
   
-  if (event.event_type === 'job.completed') {
-    console.log(`PDF rendered! Download URL: https://api.pdfik.net/jobs/${event.job_id}/download`);
+  // The payload has no event type: a finished job carries status 'done' (or 'failed').
+  // file_url is absent for jobs delivered to your own bucket (the delivery option).
+  if (event.status === 'done' && event.file_url) {
+    console.log(`PDF rendered! Download URL: ${event.file_url}`);
   }
   
   res.status(200).send('OK');
@@ -224,13 +273,16 @@ constructor(config: { apiKey: string; baseUrl?: string })
 
 - **`urlToPdf(url, opts)`**: Submits a job to convert a public URL to a PDF. Returns a `JobCreatedResponse`.
 - **`htmlToPdf(html, opts)`**: Submits a job to convert raw HTML markup to a PDF. Returns a `JobCreatedResponse`.
+- **`markdownToPdf(markdown, opts)`**: Submits a job to convert Markdown (CommonMark + GFM tables) to a PDF. Returns a `JobCreatedResponse`.
+- **`urlToImage(url, opts)`**: Submits a job to capture a public URL as a PNG/JPEG screenshot. Returns a `JobCreatedResponse`.
+- **`htmlToImage(html, opts)`**: Submits a job to capture raw HTML markup as a PNG/JPEG screenshot. Returns a `JobCreatedResponse`.
 - **`einvoiceToPdf(xml, opts)`**: Submits a Factur-X e-invoice job — builds the human-readable invoice from your CII XML with a block template, renders to PDF/A-3 and embeds the XML as `factur-x.xml`. Returns a `JobCreatedResponse`.
 - **`getJob(jobId)`**: Fetches the status of a specific job. Returns a `JobStatusResponse`.
 - **`waitForJob(jobId, opts)`**: Helper that polls `getJob` until the job is `done` or `failed`. Throws a `PdfikError` if the job fails or times out.
   - `opts.timeoutMs` (default: `120000` ms)
   - `opts.pollIntervalMs` (default: `2000` ms)
 - **`getFileUrl(jobId)`**: Returns the direct download URL for the PDF (requires the "X-API-Key" header).
-- **`downloadPdf(jobId)`**: Downloads and returns the PDF file as a `Uint8Array`.
+- **`downloadPdf(jobId)`**: Downloads and returns the output file as a `Uint8Array` — the PDF, or for image jobs the raw PNG/JPEG bytes.
 - **`verifyWebhookSignature(rawBody, headers, webhookSecret)`**: **(Static)** Verifies the webhook HMAC-SHA256 signature using the raw request body and request headers. Returns `boolean`.
 
 ## License

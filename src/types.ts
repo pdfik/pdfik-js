@@ -50,6 +50,46 @@ export interface JobAuthOptions {
   value: string;
 }
 
+/**
+ * The browser window the page is opened in. You choose the size and the server
+ * captures exactly that window — nothing is scaled or fitted.
+ */
+export interface ImageViewport {
+  /** Viewport width in CSS pixels (320 to 1920) */
+  width: number;
+  /** Viewport height in CSS pixels (320 to 8192) */
+  height: number;
+}
+
+export interface ImageOptions {
+  /** Image format: 'png' (default) or 'jpeg' */
+  format?: 'png' | 'jpeg';
+  /**
+   * Capture the whole scrollable page instead of just the visible area.
+   * Default false: the image is exactly your viewport. With true the height
+   * follows the real page and is clipped at 8192 px — a ceiling, not a target,
+   * so a 2,000 px page still gives a 2,000 px image.
+   */
+  fullPage?: boolean;
+  /** JPEG quality 1-100 (jpeg only; the server rejects quality together with png) */
+  quality?: number;
+  /** Browser viewport (defaults to 1024x768). Sets the image width; with fullPage=false (the default) also its height. */
+  viewport?: ImageViewport;
+}
+
+export interface DeliveryOptions {
+  /** Delivery mode; only 'presigned_put' exists and it is filled in when omitted */
+  mode?: 'presigned_put';
+  /**
+   * Presigned HTTPS PUT URL for your own bucket. Presign for at least 15
+   * minutes and without a Content-Type condition (the upload sends none).
+   * For delivered jobs the `job.finished` webhook carries neither `file_url`
+   * nor `expires_at` (PDFik does not record the destination), and the
+   * download endpoint answers 404.
+   */
+  url: string;
+}
+
 export type EInvoiceProfile = 'minimum' | 'basicwl' | 'basic' | 'en16931' | 'extended';
 
 export interface EInvoiceOptions {

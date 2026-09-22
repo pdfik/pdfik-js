@@ -4,6 +4,62 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-09-19
+
+The screenshots + Markdown + BYOB delivery release.
+
+### Added
+- `markdownToPdf(markdown, opts?)` — calls `POST /markdown-to-pdf`. CommonMark plus GFM
+  tables and strikethrough; raw HTML inside the Markdown is escaped by the API, never
+  rendered (use `htmlToPdf` for full HTML control), and a built-in print stylesheet is
+  applied. `opts` mirror `htmlToPdf`: `webhookUrl`, `options` (paper format, margins,
+  header/footer, watermark Starter+, `userPassword`/`compression` Pro+), `render` (Pro+),
+  `delivery` (Pro+), `idempotencyKey`, `test`. Available on every plan, Free included.
+- `urlToImage(url, opts?)` and `htmlToImage(html, opts?)` — call `POST /url-to-image` /
+  `POST /html-to-image` and produce PNG or JPEG screenshots through the same job flow.
+  New `ImageOptions`: `format` (`'png'` default | `'jpeg'`; the API also accepts `'jpg'`
+  as an alias), `fullPage` (server default `false` — the visible area only; `true`
+  follows the real page, clipped at 8,192 px), `quality` (1–100, jpeg only — the API
+  answers `422` when sent with png), `viewport` (`ImageViewport`, width 320–1920,
+  height 320–8192 CSS px, server default 1024×768). `urlToImage` supports the Pro+ `auth` option like
+  `urlToPdf`. `downloadPdf` returns the image bytes unchanged (`Content-Type:
+  image/png` / `image/jpeg`, filename `{job_id}.png` / `.jpg`); test mode returns the
+  bundled sample PNG for either format. One screenshot consumes one render unit plus its
+  bytes, same quotas as PDFs.
+- `delivery` option (`DeliveryOptions`: `url` — an https presigned PUT URL for your own
+  bucket, optional `mode` defaulting to `'presigned_put'`; Pro+ plans) on `urlToPdf`,
+  `htmlToPdf`, `einvoiceToPdf`, `markdownToPdf`, `urlToImage` and `htmlToImage`. The
+  rendered output is uploaded straight to your bucket and nothing is stored on PDFik's
+  side: the `job.finished` webhook reports the outcome only — no `file_url` and no
+  `expires_at`, because the presigned URL is a credential and is never recorded;
+  `GET /jobs/{id}/download` answers `404 #output-delivered-externally`. Presign for at
+  least 15 minutes and without a Content-Type condition. Not combinable with `test`
+  (`400`); on Free/Starter the API answers `402 PLAN_UPGRADE_REQUIRED` with
+  `feature: "delivery"`.
+- Types `ImageOptions`, `ImageViewport` and `DeliveryOptions`, exported from the package
+  root.
+- README: "Markdown to PDF", "Screenshots" and "Deliver to your own bucket (BYOB)"
+  sections; the new methods in the API reference.
+- Tests: exact request bodies for the three new methods (including `full_page`/`viewport`
+  snake_case mapping) and the `delivery` object on all five creation methods.
+
+### Changed
+- Version `0.3.0` → `0.4.0` (`package.json`, `package-lock.json`).
+
+### Fixed
+- `waitForJob` waits out an HTTP 429 instead of failing: it sleeps the API's
+  `retry_after_seconds` (capped at 60 s) and keeps polling within `timeoutMs`. On Free
+  (10 requests/min) a render longer than ~20 s used to end the wait with an error.
+- Request-validation errors (HTTP 422) now carry a readable message such as
+  `options.viewport.width: Input should be less than or equal to 1920`. The API sends
+  `detail` as a list for these, and `PdfikError.message` used to be `[object Object]`.
+- JSDoc of `delivery` and `downloadPdf` no longer claims that the `job.finished`
+  webhook's `file_url` points into your bucket: for a delivered job the webhook carries
+  neither `file_url` nor `expires_at`, and PDFik keeps no record of the destination.
+- README: the quick start used `require('fs')` inside an ES module (a `ReferenceError`
+  at run time) and the Express webhook example tested an `event_type` field the payload
+  does not have.
+
 ## [0.3.0] — 2026-09-06
 
 The e-invoicing (Factur-X) release. Everything below is what changed in the SDK
