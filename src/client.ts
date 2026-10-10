@@ -200,7 +200,7 @@ export class PdfikClient {
    * with `options.userPassword` (PDF/A forbids encryption) and
    * `options.compression` (re-saving breaks the PDF/A attributes).
    *
-   * Pass `opts.delivery` (Pro+) to upload the output straight to your own
+   * Pass `opts.delivery` to upload the output straight to your own
    * bucket via a presigned PUT URL — nothing is stored on PDFik's side, the
    * download endpoint answers 404 for such jobs, and the `job.finished`
    * webhook carries neither `file_url` nor `expires_at` (PDFik does not
@@ -242,7 +242,7 @@ export class PdfikClient {
    * with `options.userPassword` (PDF/A forbids encryption) and
    * `options.compression` (re-saving breaks the PDF/A attributes).
    *
-   * Pass `opts.delivery` (Pro+) to upload the output straight to your own
+   * Pass `opts.delivery` to upload the output straight to your own
    * bucket via a presigned PUT URL — nothing is stored on PDFik's side, the
    * download endpoint answers 404 for such jobs, and the `job.finished`
    * webhook carries neither `file_url` nor `expires_at` (PDFik does not
@@ -277,7 +277,7 @@ export class PdfikClient {
    * Job polling and download are identical to the other PDF endpoints.
    *
    * Set `opts.test = true` for test mode (full pipeline, no real rendering,
-   * sample PDF, no quota) or pass `opts.delivery` (Pro+) to upload the output
+   * sample PDF, no quota) or pass `opts.delivery` to upload the output
    * straight to your own bucket via a presigned PUT URL (not combinable with
    * `test`).
    */
@@ -380,7 +380,7 @@ export class PdfikClient {
    * dashboard editor produces) are mutually exclusive; omit both to use your
    * account's default template.
    *
-   * Pass `opts.delivery` (Pro+) to upload the output straight to your own
+   * Pass `opts.delivery` to upload the output straight to your own
    * bucket via a presigned PUT URL — nothing is stored on PDFik's side, the
    * download endpoint answers 404 for such jobs, and the `job.finished`
    * webhook carries neither `file_url` nor `expires_at` (PDFik does not

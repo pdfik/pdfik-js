@@ -4,6 +4,24 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-10-10
+
+A documentation-only release: no API or behaviour change in the client. Everything below
+is what changed in the SDK after 0.4.0 was published, according to git.
+
+### Changed
+- `delivery` is now documented as available on every plan. The API opened BYOB delivery
+  to every plan on 2026-10-09 (it used to be Pro+); that is a server-side change, and
+  the client sends exactly the same requests as 0.4.0.
+- README, "Deliver to your own bucket (BYOB)": `delivery` is described as "every plan"
+  instead of "Pro+".
+- JSDoc of `urlToPdf`, `htmlToPdf`, `markdownToPdf` and `einvoiceToPdf`: the "(Pro+)"
+  note next to `opts.delivery` is removed.
+- The 0.4.0 notes below are left as published. Where they call `delivery` Pro+ and
+  mention `402 PLAN_UPGRADE_REQUIRED` with `feature: "delivery"` on Free/Starter, they
+  describe the API as it was on 2026-09-19, not as it is now.
+- Version `0.4.0` → `0.4.1` (`package.json`, `package-lock.json`).
+
 ## [0.4.0] — 2026-09-19
 
 The screenshots + Markdown + BYOB delivery release.
