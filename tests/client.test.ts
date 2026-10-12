@@ -3,15 +3,90 @@ import { PdfikError } from '../src/errors';
 
 describe('PdfikClient', () => {
   let mockFetch: jest.Mock;
+  // The Idempotency-Key of every request, read at the moment it is sent. The
+  // mock keeps the request object by reference, so a key rewritten between two
+  // attempts would look identical in mock.calls afterwards.
+  let sentKeys: Array<string | undefined>;
 
   beforeEach(() => {
     mockFetch = jest.fn();
-    global.fetch = mockFetch as any;
+    sentKeys = [];
+    global.fetch = ((url: string, init: { headers: Record<string, string> }) => {
+      sentKeys.push(init.headers['Idempotency-Key']);
+      return mockFetch(url, init);
+    }) as any;
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
   });
+
+  // Makes every sleep return at once and records the delays that were asked for.
+  const recordSleeps = (): number[] => {
+    const sleeps: number[] = [];
+    jest.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      sleeps.push(ms ?? 0);
+      fn();
+      return 0;
+    }) as any);
+    return sleeps;
+  };
+
+  const problem = (status: number, body: object, headers: Record<string, string> = {}) => ({
+    ok: false,
+    status,
+    headers: new Headers(headers),
+    text: async () => JSON.stringify(body),
+  });
+
+  // pdf-api's rate limiter (app/middleware/rate_limit.py) as the API answered up
+  // to 2026-10-12: no `type`, the wait stated in the body and in the Retry-After
+  // header. Later releases add `type`/`title`/`status`; this older body is the
+  // one the client must keep recognising by `error` alone.
+  const rateLimited = (seconds: number) =>
+    problem(
+      429,
+      { error: 'RATE_LIMIT_EXCEEDED', detail: 'Too many requests. Please try again later.', retry_after_seconds: seconds },
+      { 'Retry-After': String(seconds) }
+    );
+
+  const jobCreated = { ok: true, json: async () => ({ job_id: 'job-123', status: 'queued', detail: 'Job queued' }) };
+
+  const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  // What a create call sends when the caller passed no idempotencyKey.
+  const generatedKey = expect.stringMatching(UUID_V4);
+
+  // Exact shapes of pdf-api's two download 429s (_download_problem in
+  // app/api/endpoints/jobs.py). The `error` code is in the body from the API
+  // release after 2026-10-12; before it the `type` is the only mark.
+  const downloadBusy = (extra: object = {}) =>
+    problem(
+      429,
+      {
+        type: 'https://docs.pdfik.net/error-codes#download-busy',
+        title: 'Too Many Requests - Download In Progress',
+        status: 429,
+        detail: 'Another download of this file is already in progress. Only one active stream per file is allowed; this rejection does not consume a download attempt.',
+        ...extra,
+      },
+      { 'Retry-After': '10' }
+    );
+
+  const downloadAttemptsExhausted = (extra: object = {}) =>
+    problem(
+      429,
+      {
+        type: 'https://docs.pdfik.net/error-codes#download-attempts-exhausted',
+        title: 'Too Many Requests - Download Attempts Exhausted',
+        status: 429,
+        detail: 'This file has been downloaded the maximum of 3 times. Submit a new render or contact support.',
+        ...extra,
+      },
+      { 'Retry-After': '3600' }
+    );
+
+  const pdfBytes = new Uint8Array([37, 80, 68, 70]);
+  const fileSent = { ok: true, arrayBuffer: async () => pdfBytes.buffer };
 
   test('urlToPdf sends correct request', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
@@ -43,6 +118,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -82,6 +158,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -117,6 +194,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -181,6 +259,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -243,6 +322,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -334,6 +414,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -374,6 +455,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -410,6 +492,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -468,6 +551,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ xml: SAMPLE_CII_XML }),
@@ -577,6 +661,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -740,27 +825,420 @@ describe('PdfikClient', () => {
   test('retry on 429 then success', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
     mockFetch
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 429,
-        text: async () => JSON.stringify({ detail: 'Rate limit exceeded' }),
-      })
+      .mockResolvedValueOnce(rateLimited(3))
       .mockResolvedValueOnce({
         ok: true,
         json: async () => ({ status: 'done' }),
       });
+    const sleeps = recordSleeps();
 
-    const originalTimeout = global.setTimeout;
-    const mockTimeout = jest.fn((fn) => fn());
-    global.setTimeout = mockTimeout as any;
+    const result = await client.getJob('job-123');
+    expect(result.status).toBe('done');
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([3000]);
+  });
+
+  test('downloadPdf waits out a rate-limit 429 for the stated time', async () => {
+    // Free is 10 requests/min: create + polls fill the window, and the download
+    // used to fail after three attempts within three seconds.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    const bytes = new Uint8Array([37, 80, 68, 70]);
+    mockFetch
+      .mockResolvedValueOnce(rateLimited(7))
+      .mockResolvedValueOnce(rateLimited(3))
+      .mockResolvedValueOnce({ ok: true, arrayBuffer: async () => bytes.buffer });
+    const sleeps = recordSleeps();
+
+    const result = await client.downloadPdf('job-123');
+
+    expect(Array.from(result)).toEqual([37, 80, 68, 70]);
+    expect(sleeps).toEqual([7000, 3000]);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('a create call waits out a rate-limit 429 and resends the same request', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(rateLimited(4))
+      .mockResolvedValueOnce(rateLimited(1))
+      .mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    const job = await client.urlToPdf('https://example.com', { idempotencyKey: 'key-1' });
+
+    expect(job.jobId).toBe('job-123');
+    expect(sleeps).toEqual([4000, 1000]);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch.mock.calls[2]).toEqual(mockFetch.mock.calls[0]);
+  });
+
+  test('a rate-limit 429 that never clears is thrown after five waits', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(rateLimited(2));
+    const sleeps = recordSleeps();
+
+    await expect(client.downloadPdf('job-123')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 429,
+      errorCode: 'RATE_LIMIT_EXCEEDED',
+      message: 'Too many requests. Please try again later.',
+    });
+    expect(sleeps).toEqual([2000, 2000, 2000, 2000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(6);
+  });
+
+  test('the concurrency-limit 429 is waited out by its Retry-After header', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    // Exact shape of pdf-api's concurrency_limit_handler (app/main.py): the wait
+    // is stated in the header only.
+    mockFetch
+      .mockResolvedValueOnce(
+        problem(
+          429,
+          {
+            type: 'https://docs.pdfik.net/error-codes#concurrency-limit',
+            title: 'Too Many Requests - Concurrency Limit',
+            status: 429,
+            error: 'CONCURRENCY_LIMIT_EXCEEDED',
+            detail: "You already have 2 jobs queued or rendering; plan 'free' allows 2 at a time. Poll your pending jobs and retry.",
+            plan: 'free',
+            limit: 2,
+            in_flight: 2,
+            upgrade_url: 'https://pdfik.net/dashboard/billing',
+          },
+          { 'Retry-After': '5' }
+        )
+      )
+      .mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    await client.htmlToPdf('<h1>Hi</h1>');
+
+    expect(sleeps).toEqual([5000]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('a throttle with no stated time waits 10 s, and a stated time is capped at 60 s', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(problem(429, { type: 'https://docs.pdfik.net/error-codes#rate-limit-exceeded' }))
+      .mockResolvedValueOnce(problem(429, { error: 'RATE_LIMIT_EXCEEDED' }, { 'Retry-After': '3600' }))
+      .mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    await client.markdownToPdf('# Hi');
+
+    expect(sleeps).toEqual([10000, 60000]);
+  });
+
+  test.each<[string, (c: PdfikClient) => Promise<unknown>, object, string | undefined]>([
+    [
+      'the monthly byte quota',
+      (c: PdfikClient) => c.urlToPdf('https://example.com'),
+      // Exact shape of pdf-api's byte_quota_exceeded_handler (app/main.py).
+      problem(429, {
+        type: 'https://docs.pdfik.net/error-codes#quota-bytes-exceeded',
+        title: 'Too Many Requests - Byte Quota Exceeded',
+        status: 429,
+        error: 'BYTE_QUOTA_EXCEEDED',
+        detail: "Monthly generated-data quota of 536870912 bytes for plan 'free' exceeded (536870912 bytes used this billing window).",
+        plan: 'free',
+        limit: 536870912,
+        used: 536870912,
+        upgrade_url: 'https://pdfik.net/dashboard/billing',
+      }),
+      'BYTE_QUOTA_EXCEEDED',
+    ],
+    [
+      'the test-mode cap',
+      (c: PdfikClient) => c.urlToPdf('https://example.com', { test: true }),
+      problem(
+        429,
+        {
+          type: 'https://docs.pdfik.net/error-codes#test-rate-limit-exceeded',
+          title: 'Too Many Requests - Test Mode Rate Limit',
+          status: 429,
+          error: 'TEST_RATE_LIMIT_EXCEEDED',
+          detail: 'Test-mode submissions are free of quota but capped at 60 per minute per account. Retry after the window resets.',
+          limit: 60,
+          window: 'minute',
+        },
+        { 'Retry-After': '30' }
+      ),
+      'TEST_RATE_LIMIT_EXCEEDED',
+    ],
+    [
+      'an exhausted download counter',
+      (c: PdfikClient) => c.downloadPdf('job-123'),
+      downloadAttemptsExhausted(),
+      undefined,
+    ],
+    [
+      'an exhausted download counter that states its error code',
+      (c: PdfikClient) => c.downloadPdf('job-123'),
+      downloadAttemptsExhausted({ error: 'DOWNLOAD_ATTEMPTS_EXHAUSTED' }),
+      'DOWNLOAD_ATTEMPTS_EXHAUSTED',
+    ],
+    [
+      'download-busy on a call that is not the download',
+      (c: PdfikClient) => c.getJob('job-123'),
+      downloadBusy({ error: 'DOWNLOAD_BUSY' }),
+      'DOWNLOAD_BUSY',
+    ],
+    [
+      'a 429 the API did not write',
+      (c: PdfikClient) => c.getJob('job-123'),
+      { ok: false, status: 429, headers: new Headers({ 'Retry-After': '1' }), text: async () => '<html>Too Many Requests</html>' },
+      undefined,
+    ],
+  ])('no wait and no retry on a 429 for %s', async (_name, call, response, errorCode) => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(response);
+    const sleeps = recordSleeps();
+
+    await expect(call(client)).rejects.toMatchObject({ name: 'PdfikError', statusCode: 429, errorCode });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('downloadPdf waits out a busy download for the stated 10 s and returns the file', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(downloadBusy({ error: 'DOWNLOAD_BUSY' }))
+      .mockResolvedValueOnce(fileSent);
+    const sleeps = recordSleeps();
+
+    const result = await client.downloadPdf('job-123');
+
+    expect(Array.from(result)).toEqual([37, 80, 68, 70]);
+    expect(sleeps).toEqual([10000]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test.each<[string, object]>([
+    ['its type alone', downloadBusy()],
+    [
+      'its error code alone',
+      problem(429, { error: 'DOWNLOAD_BUSY', detail: 'Another download of this file is already in progress.' }, { 'Retry-After': '10' }),
+    ],
+  ])('a busy download is recognised by %s', async (_name, response) => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce(response).mockResolvedValueOnce(fileSent);
+    const sleeps = recordSleeps();
+
+    const result = await client.downloadPdf('job-123');
+
+    expect(Array.from(result)).toEqual([37, 80, 68, 70]);
+    expect(sleeps).toEqual([10000]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('a busy download that never clears is thrown after five waits', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(downloadBusy());
+    const sleeps = recordSleeps();
+
+    await expect(client.downloadPdf('job-123')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 429,
+      message: 'Another download of this file is already in progress. Only one active stream per file is allowed; this rejection does not consume a download attempt.',
+    });
+    expect(sleeps).toEqual([10000, 10000, 10000, 10000, 10000]);
+    expect(mockFetch).toHaveBeenCalledTimes(6);
+  });
+
+  test('busy and rate-limit waits on one download share the five', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(rateLimited(2))
+      .mockResolvedValueOnce(downloadBusy())
+      .mockResolvedValueOnce(rateLimited(2))
+      .mockResolvedValueOnce(downloadBusy())
+      .mockResolvedValueOnce(rateLimited(2))
+      .mockResolvedValueOnce(downloadBusy({ error: 'DOWNLOAD_BUSY' }));
+    const sleeps = recordSleeps();
+
+    await expect(client.downloadPdf('job-123')).rejects.toMatchObject({ statusCode: 429, errorCode: 'DOWNLOAD_BUSY' });
+    expect(sleeps).toEqual([2000, 10000, 2000, 10000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(6);
+  });
+
+  test('a 500 followed by 200 succeeds after the usual 1 s backoff', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(problem(500, { detail: 'Failed to create job. Please try again later.' }))
+      .mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    const job = await client.urlToPdf('https://example.com');
+
+    expect(job.jobId).toBe('job-123');
+    expect(sleeps).toEqual([1000]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('a throttle wait does not use up one of the three 5xx attempts', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(problem(502, {}))
+      .mockResolvedValueOnce(rateLimited(6))
+      .mockResolvedValueOnce(problem(502, {}))
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'done' }) });
+    const sleeps = recordSleeps();
+
+    const result = await client.getJob('job-123');
+
+    expect(result.status).toBe('done');
+    expect(sleeps).toEqual([1000, 6000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  test('a create call without a key sends one generated key, the same on every resend after a 5xx', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(problem(500, { detail: 'Failed to create job. Please try again later.' }))
+      .mockResolvedValueOnce(problem(502, {}))
+      .mockResolvedValueOnce(jobCreated);
+    recordSleeps();
+
+    await client.urlToPdf('https://example.com');
+
+    expect(sentKeys).toHaveLength(3);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys).toEqual([sentKeys[0], sentKeys[0], sentKeys[0]]);
+  });
+
+  test('the generated key stays the same across a throttle wait', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(rateLimited(4))
+      .mockResolvedValueOnce(rateLimited(1))
+      .mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    await client.htmlToPdf('<h1>Hi</h1>');
+
+    expect(sleeps).toEqual([4000, 1000]);
+    expect(sentKeys).toHaveLength(3);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys).toEqual([sentKeys[0], sentKeys[0], sentKeys[0]]);
+  });
+
+  test('two separate create calls use two different generated keys', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(jobCreated);
+
+    await client.urlToPdf('https://example.com');
+    await client.urlToPdf('https://example.com');
+
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys[1]).toMatch(UUID_V4);
+    expect(sentKeys[1]).not.toBe(sentKeys[0]);
+  });
+
+  test("the caller's key is sent unchanged on every attempt", async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce(problem(500, {}))
+      .mockResolvedValueOnce(rateLimited(3))
+      .mockResolvedValueOnce(jobCreated);
+    recordSleeps();
+
+    await client.urlToImage('https://example.com', { idempotencyKey: 'order_42:shot-1.v2' });
+
+    expect(sentKeys).toEqual(['order_42:shot-1.v2', 'order_42:shot-1.v2', 'order_42:shot-1.v2']);
+  });
+
+  test('every job-creating method sends an Idempotency-Key: generated, or the one it was given', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(jobCreated);
+
+    const create = async (opts?: { idempotencyKey: string }) => {
+      await client.urlToPdf('https://example.com', opts);
+      await client.htmlToPdf('<h1>Hi</h1>', opts);
+      await client.markdownToPdf('# Hi', opts);
+      await client.urlToImage('https://example.com', opts);
+      await client.htmlToImage('<h1>Hi</h1>', opts);
+      await client.einvoiceToPdf('<rsm:CrossIndustryInvoice/>', opts);
+    };
+    await create();
+    await create({ idempotencyKey: 'mine-1' });
+
+    expect(sentKeys).toHaveLength(12);
+    const generated = sentKeys.slice(0, 6);
+    for (const key of generated) {
+      expect(key).toMatch(UUID_V4);
+    }
+    expect(new Set(generated).size).toBe(6);
+    expect(sentKeys.slice(6)).toEqual(Array(6).fill('mine-1'));
+  });
+
+  // A browser bundle has no Node `crypto` (the bundler stubs the import out) and a
+  // page on plain http has no `crypto.randomUUID` either. Creating a job must
+  // still work there.
+  test('the generated Idempotency-Key does not need crypto.randomUUID', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(jobCreated);
+    // Hide it in both places the client looks, and put both back afterwards.
+    const hidden = [require('crypto'), (globalThis as any).crypto]
+      .filter(Boolean)
+      .map((target) => ({ target, own: Object.getOwnPropertyDescriptor(target, 'randomUUID') }));
+    for (const { target } of hidden) {
+      Object.defineProperty(target, 'randomUUID', { value: undefined, configurable: true, writable: true });
+    }
 
     try {
-      const result = await client.getJob('job-123');
-      expect(result.status).toBe('done');
-      expect(mockFetch).toHaveBeenCalledTimes(2);
+      await client.urlToPdf('https://example.com');
+      await client.htmlToPdf('<h1>Hi</h1>');
     } finally {
-      global.setTimeout = originalTimeout;
+      for (const { target, own } of hidden) {
+        if (own) Object.defineProperty(target, 'randomUUID', own);
+        else delete target.randomUUID;
+      }
     }
+
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys[1]).toMatch(UUID_V4);
+    expect(sentKeys[0]).not.toBe(sentKeys[1]);
+  });
+
+  test('status and download requests carry no Idempotency-Key', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'done' }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'done' }) })
+      .mockResolvedValueOnce(fileSent);
+
+    await client.getJob('job-123');
+    await client.waitForJob('job-123');
+    await client.downloadPdf('job-123');
+
+    expect(mockFetch.mock.calls.map((call) => call[0])).toEqual([
+      'https://api.pdfik.net/jobs/job-123',
+      'https://api.pdfik.net/jobs/job-123',
+      'https://api.pdfik.net/jobs/job-123/download',
+    ]);
+    expect(sentKeys).toEqual([undefined, undefined, undefined]);
+    for (const [, init] of mockFetch.mock.calls) {
+      expect(init.headers).toEqual({ 'X-API-Key': 'sk_test_123' });
+    }
+  });
+
+  test('waitForJob: each 429 costs one wait, also past the five the request path allows', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    for (let i = 0; i < 7; i++) {
+      mockFetch.mockResolvedValueOnce(rateLimited(2));
+    }
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ status: 'done' }) });
+    const sleeps = recordSleeps();
+
+    const result = await client.waitForJob('job-123', { pollIntervalMs: 500, timeoutMs: 60000 });
+
+    expect(result.status).toBe('done');
+    expect(sleeps).toEqual([2000, 2000, 2000, 2000, 2000, 2000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(8);
   });
 
   test('no retry on 401', async () => {

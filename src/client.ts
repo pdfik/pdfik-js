@@ -57,24 +57,91 @@ export interface PdfikClientConfig {
   baseUrl?: string;
 }
 
+const MAX_ATTEMPTS = 3;
+const BACKOFF_INITIAL_MS = 1000;
+// A throttle is waited out, not counted as a failed attempt — but not forever:
+// after this many waits the 429 is thrown.
+const THROTTLE_WAITS = 5;
+const RETRY_AFTER_FALLBACK_MS = 10000;
+const RETRY_AFTER_CAP_SECONDS = 60; // the server states the wait; it must not be able to park the caller
+
+function problemBody(error: PdfikError): Record<string, unknown> {
+  try {
+    const data = JSON.parse(error.responseBody || '{}');
+    return data && typeof data === 'object' ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Whether the error is the documented case `slug`: the fragment of its `type`
+ * URL (https://docs.pdfik.net/error-codes#<slug>) or the `error` code spelled in
+ * upper snake case. */
+function isCase(error: PdfikError, slug: string): boolean {
+  const type = problemBody(error).type;
+  if (typeof type === 'string' && type.endsWith(`#${slug}`)) return true;
+  return error.errorCode?.toUpperCase() === slug.replace(/-/g, '_').toUpperCase();
+}
+
+/** The two 429s that clear by themselves within a minute — the per-account
+ * request rate and the in-flight job cap. A quota 429 (monthly bytes), the
+ * test-mode caps and an exhausted download counter do not, so they are thrown
+ * at once. */
+function isThrottled(error: PdfikError): boolean {
+  return (
+    error.statusCode === 429 &&
+    (isCase(error, 'rate-limit-exceeded') || isCase(error, 'concurrency-limit-exceeded'))
+  );
+}
+
+/** The download has a third 429 that clears by itself: another stream of the
+ * same file is still open. It costs no download attempt, so it is waited out
+ * like a throttle. An exhausted attempt counter is not — no wait brings the
+ * attempts back. */
+function isDownloadThrottled(error: PdfikError): boolean {
+  return isThrottled(error) || (error.statusCode === 429 && isCase(error, 'download-busy'));
+}
+
+/** The header that makes a resent create safe: the API answers a repeated key
+ * with the ORIGINAL job, so a create whose first answer was lost (a 5xx after
+ * the job already existed) cannot produce — and charge — a second one. Built
+ * once per call, so every resend of that call carries the same key. */
+function idempotencyHeader(key?: string): Record<string, string> {
+  return { 'Idempotency-Key': key || newUuid() };
+}
+
+/** A UUID v4, from whatever the runtime has. Web Crypto first (browsers, Edge,
+ * Node 19+), then Node's own module (Node 18 has no global `crypto`). A browser
+ * bundle gets that module stubbed out, and a page served over plain http has no
+ * `randomUUID`, so the last branch builds one by hand: the key only has to
+ * differ from call to call, it is not a secret. */
+function newUuid(): string {
+  const web = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (typeof web?.randomUUID === 'function') return web.randomUUID();
+  const node = crypto as { randomUUID?: () => string } | undefined;
+  if (typeof node?.randomUUID === 'function') return node.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.floor(Math.random() * 16);
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
+/** Milliseconds to wait after a 429: the API's `retry_after_seconds`, else its
+ * `Retry-After` header in seconds (either one capped), else `fallbackMs`. */
+function throttleDelayMs(error: PdfikError, fallbackMs: number, headers?: Headers): number {
+  let seconds = Number(problemBody(error).retry_after_seconds);
+  if (!(seconds > 0) && headers) {
+    seconds = Number(headers.get('Retry-After'));
+  }
+  return seconds > 0 ? Math.min(seconds, RETRY_AFTER_CAP_SECONDS) * 1000 : fallbackMs;
+}
+
 /**
  * Readable text for an error body's `detail`. Request-validation errors (422)
  * carry a LIST of `{ loc, msg }` items instead of a string — assigned as-is it
  * became the message "[object Object]". They read as
  * "options.viewport.width: Input should be less than or equal to 1920".
  */
-/** Milliseconds to wait after a 429 while polling: the API's `retry_after_seconds`
- * (capped at 60 s so the server cannot park the caller), else `fallbackMs`. */
-function throttleDelayMs(error: PdfikError, fallbackMs: number): number {
-  try {
-    const seconds = Number(JSON.parse(error.responseBody || '{}').retry_after_seconds);
-    if (seconds > 0) return Math.min(seconds, 60) * 1000;
-  } catch {
-    // not JSON — fall back
-  }
-  return fallbackMs;
-}
-
 function errorDetail(detail: unknown): string | undefined {
   if (Array.isArray(detail)) {
     const parts = detail.map((item) => {
@@ -108,7 +175,8 @@ export class PdfikClient {
     path: string,
     method: string,
     body?: any,
-    extraHeaders?: Record<string, string>
+    extraHeaders?: Record<string, string>,
+    throttled: (error: PdfikError) => boolean = isThrottled
   ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
@@ -129,60 +197,53 @@ export class PdfikClient {
       fetchOptions.body = JSON.stringify(mapKeys(body, camelToSnake));
     }
 
-    const executeCall = async () => {
+    let attempt = 0;
+    let throttleWaits = 0;
+    while (true) {
       const response = await fetch(url, fetchOptions);
-      if (!response.ok) {
-        let errorCode: string | undefined;
-        let message = `API request failed with status ${response.status}`;
-        let responseBody = '';
-        try {
-          responseBody = await response.text();
-          const data = JSON.parse(responseBody);
-          if (data && typeof data === 'object') {
-            const detail = errorDetail(data.detail);
-            if (detail) {
-              message = detail;
-            }
-            // pdf-api's RFC 7807 bodies carry the code in `error`
-            // (QUOTA_EXCEEDED, EINVOICE_XML_INVALID, …); `error_code` is kept
-            // as a fallback for any body that still uses it.
-            const code = data.error ?? data.error_code;
-            if (typeof code === 'string' && code) {
-              errorCode = code;
-            }
-          }
-        } catch {
-          // ignore JSON/text reading errors
-        }
-        throw new PdfikError(message, response.status, errorCode, responseBody);
+      if (response.ok) {
+        return response;
       }
-      return response;
-    };
-
-    return this.retryWithBackoff(executeCall);
+      const error = await this.errorFrom(response);
+      if (throttled(error) && throttleWaits < THROTTLE_WAITS) {
+        throttleWaits++;
+        const delay = throttleDelayMs(error, RETRY_AFTER_FALLBACK_MS, response.headers);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      attempt++;
+      if (attempt >= MAX_ATTEMPTS || error.statusCode < 500) {
+        throw error;
+      }
+      const delay = BACKOFF_INITIAL_MS * Math.pow(2, attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
   }
 
-  private async retryWithBackoff<T>(
-    fn: () => Promise<T>,
-    maxAttempts = 3,
-    initialDelayMs = 1000
-  ): Promise<T> {
-    let attempt = 0;
-    while (true) {
-      try {
-        return await fn();
-      } catch (error) {
-        attempt++;
-        if (
-          attempt >= maxAttempts ||
-          !(error instanceof PdfikError && (error.statusCode >= 500 || error.statusCode === 429))
-        ) {
-          throw error;
+  private async errorFrom(response: Response): Promise<PdfikError> {
+    let errorCode: string | undefined;
+    let message = `API request failed with status ${response.status}`;
+    let responseBody = '';
+    try {
+      responseBody = await response.text();
+      const data = JSON.parse(responseBody);
+      if (data && typeof data === 'object') {
+        const detail = errorDetail(data.detail);
+        if (detail) {
+          message = detail;
         }
-        const delay = initialDelayMs * Math.pow(2, attempt - 1);
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        // pdf-api's RFC 7807 bodies carry the code in `error`
+        // (QUOTA_EXCEEDED, EINVOICE_XML_INVALID, …); `error_code` is kept
+        // as a fallback for any body that still uses it.
+        const code = data.error ?? data.error_code;
+        if (typeof code === 'string' && code) {
+          errorCode = code;
+        }
       }
+    } catch {
+      // ignore JSON/text reading errors
     }
+    return new PdfikError(message, response.status, errorCode, responseBody);
   }
 
   /**
@@ -221,8 +282,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
-    const res = await this.request('/url-to-pdf', 'POST', body, extraHeaders);
+    const res = await this.request('/url-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
@@ -262,8 +322,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
-    const res = await this.request('/html-to-pdf', 'POST', body, extraHeaders);
+    const res = await this.request('/html-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
@@ -294,8 +353,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
-    const res = await this.request('/markdown-to-pdf', 'POST', body, extraHeaders);
+    const res = await this.request('/markdown-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
@@ -327,8 +385,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
-    const res = await this.request('/url-to-image', 'POST', body, extraHeaders);
+    const res = await this.request('/url-to-image', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
@@ -358,8 +415,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
-    const res = await this.request('/html-to-image', 'POST', body, extraHeaders);
+    const res = await this.request('/html-to-image', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
@@ -399,8 +455,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const extraHeaders = opts?.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : undefined;
-    const res = await this.request('/einvoice-to-pdf', 'POST', body, extraHeaders);
+    const res = await this.request('/einvoice-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
@@ -422,11 +477,15 @@ export class PdfikClient {
     while (true) {
       let job: JobStatusResponse;
       try {
-        job = await this.getJob(jobId);
+        // No waiting inside the request while polling: a 429 is thrown at once
+        // and waited out below, where `timeoutMs` is checked, so the caller's
+        // timeout stays in charge.
+        const res = await this.request(`/jobs/${jobId}`, 'GET', undefined, undefined, () => false);
+        job = mapKeys(await res.json(), snakeToCamel) as JobStatusResponse;
       } catch (error) {
         // A 429 while polling is a throttle, not a failure: on Free (10
         // requests/min) a render longer than ~20 s used to end the wait with an
-        // error. Wait it out, within the same timeout.
+        // error. Wait it out, within the same timeout; one 429 costs one wait.
         if (!(error instanceof PdfikError) || error.statusCode !== 429) throw error;
         if (Date.now() - startTime >= timeoutMs) {
           throw new PdfikError(`Job ${jobId} timed out`, 408, 'TIMEOUT');
@@ -469,9 +528,13 @@ export class PdfikClient {
    * bytes. Jobs submitted with the `delivery` option have no download here —
    * the file lives in your own bucket, at the address you presigned, and this
    * endpoint answers 404.
+   *
+   * Only one stream of a file may be open at a time: while another one is, the
+   * API answers `429` download-busy and this call waits it out (it costs no
+   * download attempt). `429` download-attempts-exhausted is thrown at once.
    */
   async downloadPdf(jobId: string): Promise<Uint8Array> {
-    const res = await this.request(`/jobs/${jobId}/download`, 'GET');
+    const res = await this.request(`/jobs/${jobId}/download`, 'GET', undefined, undefined, isDownloadThrottled);
     const buffer = await res.arrayBuffer();
     return new Uint8Array(buffer);
   }

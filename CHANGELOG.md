@@ -4,6 +4,45 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-10-12
+
+### Fixed
+- A rate-limit `429` on a create call or on `downloadPdf` is now waited out the way it
+  already was while polling. The client sleeps for the time the API states
+  (`retry_after_seconds`, else the `Retry-After` header, else 10 s; capped at 60 s) and
+  sends the same request again — up to five waits per call, after which the `429` is
+  thrown as before. It used to make three attempts within about three seconds and then
+  throw, so on Free (10 requests/min) a program that created a job, polled it and
+  downloaded the file could fail at the download, or at the next create, whenever the
+  per-minute window was full. The in-flight job cap (`CONCURRENCY_LIMIT_EXCEEDED`) is
+  waited out the same way, and so is a `429` on `getJob`. `5xx` errors are retried
+  exactly as before (three attempts, 1 s and 2 s apart).
+- A retried create call can no longer produce a second job. Every create method
+  (`urlToPdf`, `htmlToPdf`, `markdownToPdf`, `urlToImage`, `htmlToImage`,
+  `einvoiceToPdf`) now sends an `Idempotency-Key` header by itself: the `idempotencyKey`
+  you passed, unchanged, or else one random UUID per call — the same on every resend of
+  that call, after a `5xx` and after a throttle wait alike. The API answers a repeated
+  key with the original job. Before, when a `5xx` reached the client although the job
+  had already been created, the retry created a second job and it was charged too,
+  unless you had passed a key yourself. `getJob` and `downloadPdf` send no such header.
+  The key comes from Web Crypto where the runtime has it, so this works in browsers and
+  on Edge as well as in Node 18+.
+- `downloadPdf` waits out a busy download. `429` `download-busy` — another stream of the
+  same file is still open — clears by itself within seconds and costs no download
+  attempt, so it is treated like the throttles above: the client sleeps for the stated
+  time (`Retry-After: 10`) and asks again, within the same five waits per call. It is
+  recognised by its `type` or by the `DOWNLOAD_BUSY` error code.
+- Quota `429`s are no longer retried. The monthly byte quota (`BYTE_QUOTA_EXCEEDED`), the
+  test-mode caps (`TEST_RATE_LIMIT_EXCEEDED`), an exhausted download counter
+  (`download-attempts-exhausted`) and every other `429` that is not waited out above are
+  thrown at once: waiting inside the call does not clear them, and the client used to
+  spend three attempts on each.
+
+### Changed
+- README: the "Auto Retry" feature line and the "Downloads" limit describe the behaviour
+  above.
+- Version `0.4.1` → `0.4.2` (`package.json`, `package-lock.json`).
+
 ## [0.4.1] — 2026-10-10
 
 A documentation-only release: no API or behaviour change in the client. Everything below

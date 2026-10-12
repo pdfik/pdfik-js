@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-10).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-12).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -12,7 +12,7 @@ Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed w
 - **TypeScript Native**: Full auto-complete and type safety for all endpoints.
 - **Dual Build**: ES Modules (ESM) and CommonJS (CJS) support.
 - **Zero Runtime Dependencies**: Uses native `fetch` (Node 18+, browsers, Edge).
-- **Auto Retry**: Automatic exponential backoff for `5xx` and `429` (Rate Limit) errors.
+- **Auto Retry**: Automatic exponential backoff for `5xx` errors. A rate-limit or concurrency-limit `429` is waited out for the time the API states on every call — create, status and download — and so is a busy download (`download-busy`); quota `429`s are thrown at once, without a retry. Every create call carries an `Idempotency-Key` header — the `idempotencyKey` you pass, otherwise one generated per call and reused on every resend — so a retried create returns the original job instead of creating a second one.
 - **DX Affordances**: Built-in polling logic (`waitForJob`) and binary download helpers.
 - **E-invoicing**: Factur-X / ZUGFeRD hybrid PDF/A-3 output — generated from your CII XML alone (`einvoiceToPdf`) or attached to your own render (the `einvoice` option).
 
@@ -210,7 +210,7 @@ The `einvoice` option is mutually exclusive with `options.userPassword` (PDF/A f
 - **Generated volume per month** (byte quota, counts rendered output only — downloads are free): Free 0.5 GB, Starter 10 GB, Pro 50 GB, Business 300 GB. Business plans can purchase additional +1 GB blocks from the dashboard. Exceeding the quota returns `429` ([quota-bytes-exceeded](https://docs.pdfik.net/error-codes#quota-bytes-exceeded)).
 - **File size**: up to 150 MB per PDF on every plan — contact support if you need more. A larger render fails the job with `FILE_TOO_LARGE` ([file-too-large](https://docs.pdfik.net/error-codes#file-too-large)).
 - **Retention**: each file is available for download for 24 hours after the job finishes; the exact deadline is the `expiresAt` field in the job status (`expires_at` in the webhook payload). After that the download returns `410` ([file-expired](https://docs.pdfik.net/error-codes#file-expired)).
-- **Downloads**: at most 3 download attempts per file (counted when the stream starts); after that the API returns `429` ([download-attempts-exhausted](https://docs.pdfik.net/error-codes#download-attempts-exhausted)) — re-render the file or contact support. Only 1 download stream may be active at a time; a concurrent request returns `429` ([download-busy](https://docs.pdfik.net/error-codes#download-busy)) — wait ~10 seconds and retry, it does not burn an attempt.
+- **Downloads**: at most 3 download attempts per file (counted when the stream starts); after that the API returns `429` ([download-attempts-exhausted](https://docs.pdfik.net/error-codes#download-attempts-exhausted)) — re-render the file or contact support. Only 1 download stream may be active at a time; a concurrent request returns `429` ([download-busy](https://docs.pdfik.net/error-codes#download-busy)), which does not burn an attempt — `downloadPdf` waits about 10 seconds and asks again by itself.
 
 ### Handling Webhooks
 
