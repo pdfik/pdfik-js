@@ -88,6 +88,15 @@ describe('PdfikClient', () => {
   const pdfBytes = new Uint8Array([37, 80, 68, 70]);
   const fileSent = { ok: true, arrayBuffer: async () => pdfBytes.buffer };
 
+  // A sync-mode (`wait: true`) answer: the response IS the file, with the job
+  // id in a header (app/core/sync_wait.py `_serve_done`).
+  const syncFileSent = (contentType = 'application/pdf', jobId = 'job-sync-1') => ({
+    ok: true,
+    status: 200,
+    headers: new Headers({ 'content-type': contentType, 'x-pdfik-job-id': jobId }),
+    arrayBuffer: async () => pdfBytes.buffer,
+  });
+
   test('urlToPdf sends correct request', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
     mockFetch.mockResolvedValueOnce({
@@ -1268,6 +1277,182 @@ describe('PdfikClient', () => {
       'https://api.pdfik.net/jobs/job-123/download',
       expect.any(Object)
     );
+  });
+
+  test('urlToPdfFile sends wait: true with an Idempotency-Key and returns the file bytes', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce(syncFileSent());
+
+    const result = await client.urlToPdfFile('https://example.com', {
+      options: { format: 'A4', printBackground: true },
+    });
+
+    expect(result).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result)).toEqual([37, 80, 68, 70]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe('https://api.pdfik.net/url-to-pdf');
+    expect(JSON.parse(init.body)).toEqual({
+      url: 'https://example.com',
+      options: { format: 'A4', print_background: true },
+      wait: true,
+    });
+    expect(sentKeys).toEqual([generatedKey]);
+  });
+
+  test('a 503 sync-timeout is thrown after exactly one fetch — the job was cancelled, retrying is the caller\'s choice', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    // Exact shape of pdf-api's _sync_timeout_response (app/core/sync_wait.py).
+    // The job was cancelled, NOT charged, and the Idempotency-Key released: a
+    // resend would start a fresh render of a page already known to be slow, so
+    // the client must not spend the usual 5xx attempts here.
+    mockFetch.mockResolvedValue(
+      problem(503, {
+        type: 'https://docs.pdfik.net/error-codes#sync-timeout',
+        title: 'Gateway Timeout - Render Did Not Finish In Time',
+        status: 503,
+        error: 'SYNC_TIMEOUT',
+        detail:
+          'The render did not finish within 45 seconds. The job was cancelled and NOT charged, and its Idempotency-Key was released, so retrying is safe. For renders this long, submit without "wait" and use a webhook or polling instead.',
+        job_id: 'job-sync-2',
+      })
+    );
+    const sleeps = recordSleeps();
+
+    await expect(client.urlToPdfFile('https://slow.example.com')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 503,
+      errorCode: 'SYNC_TIMEOUT',
+    });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a *File call waits out a rate-limit 429 and resends the same key', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce(rateLimited(3)).mockResolvedValueOnce(syncFileSent());
+    const sleeps = recordSleeps();
+
+    const result = await client.urlToPdfFile('https://example.com');
+
+    expect(Array.from(result)).toEqual([37, 80, 68, 70]);
+    expect(sleeps).toEqual([3000]);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys[1]).toBe(sentKeys[0]);
+  });
+
+  // A server from before sync mode ignores the unknown `wait` field and
+  // answers the usual 202 JSON. That is a job receipt, not the file — handing
+  // it back as bytes would write `{"job_id": …}` into someone's page.pdf.
+  test.each<[string, number, Headers]>([
+    // No content-type on the 202 row: the status alone must be enough.
+    ['a 202, even without a content type', 202, new Headers()],
+    ['a 200 whose body is JSON', 200, new Headers({ 'content-type': 'application/json; charset=utf-8' })],
+  ])('an old server that ignores wait (%s) is refused with the job id to poll', async (_name, status, headers) => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status,
+      headers,
+      text: async () => JSON.stringify({ job_id: 'job-old-1', status: 'queued', detail: 'Job queued' }),
+    });
+
+    try {
+      await client.markdownToPdfFile('# Hi');
+      fail('Should have thrown');
+    } catch (e: any) {
+      expect(e).toBeInstanceOf(PdfikError);
+      expect(e.statusCode).toBe(status);
+      expect(e.errorCode).toBe('SYNC_MODE_UNSUPPORTED');
+      expect(e.message).toContain('the server ignored wait: true');
+      expect(e.message).toContain('poll the job instead');
+      expect(e.message).toContain('job-old-1');
+    }
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a 422 job-failed carries the render\'s own error code, after a single fetch', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    // Exact shape of pdf-api's _job_failed_response (app/core/sync_wait.py).
+    mockFetch.mockResolvedValue(
+      problem(422, {
+        type: 'https://docs.pdfik.net/error-codes#job-failed',
+        title: 'Unprocessable Entity - Render Failed',
+        status: 422,
+        error: 'PAGE_TIMEOUT',
+        detail:
+          'The render failed with error code PAGE_TIMEOUT. See https://docs.pdfik.net/error-codes#job-failed for what each code means.',
+        job_id: 'job-sync-3',
+      })
+    );
+    const sleeps = recordSleeps();
+
+    await expect(client.urlToPdfFile('https://example.com')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 422,
+      errorCode: 'PAGE_TIMEOUT',
+    });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a plain 5xx on a *File call is thrown at once, unlike on the async methods', async () => {
+    // A sync call cannot tell a gateway's own 5xx from one that cut a live
+    // render; resending blind could render — and charge — twice, so the
+    // three-attempt 5xx retry stays off for the whole call.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(problem(502, {}));
+    const sleeps = recordSleeps();
+
+    await expect(client.htmlToPdfFile('<h1>Hi</h1>')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 502,
+    });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  // Mirrors 'every job-creating method sends an Idempotency-Key' for the six
+  // synchronous siblings; that test keeps its 12 async calls unchanged.
+  test('every *File method sends wait: true, no delivery, and an Idempotency-Key: generated, or the one it was given', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue(syncFileSent());
+
+    const createAll = async (opts?: { idempotencyKey: string }) => {
+      await client.urlToPdfFile('https://example.com', opts);
+      await client.htmlToPdfFile('<h1>Hi</h1>', opts);
+      await client.markdownToPdfFile('# Hi', opts);
+      await client.urlToImageFile('https://example.com', opts);
+      await client.htmlToImageFile('<h1>Hi</h1>', opts);
+      await client.einvoiceToPdfFile('<rsm:CrossIndustryInvoice/>', opts);
+    };
+    await createAll();
+    await createAll({ idempotencyKey: 'mine-sync-1' });
+
+    expect(mockFetch).toHaveBeenCalledTimes(12);
+    const endpoints = [
+      'https://api.pdfik.net/url-to-pdf',
+      'https://api.pdfik.net/html-to-pdf',
+      'https://api.pdfik.net/markdown-to-pdf',
+      'https://api.pdfik.net/url-to-image',
+      'https://api.pdfik.net/html-to-image',
+      'https://api.pdfik.net/einvoice-to-pdf',
+    ];
+    expect(mockFetch.mock.calls.map((call) => call[0])).toEqual([...endpoints, ...endpoints]);
+    for (const [, init] of mockFetch.mock.calls) {
+      const sent = JSON.parse(init.body);
+      expect(sent.wait).toBe(true);
+      expect(sent.delivery).toBeUndefined();
+    }
+    expect(sentKeys).toHaveLength(12);
+    const generated = sentKeys.slice(0, 6);
+    for (const key of generated) {
+      expect(key).toMatch(UUID_V4);
+    }
+    expect(new Set(generated).size).toBe(6);
+    expect(sentKeys.slice(6)).toEqual(Array(6).fill('mine-sync-1'));
   });
 
   test('verifyWebhookSignature validates signatures correctly', () => {

@@ -1,18 +1,19 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-12).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-20).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
-Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
+Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
 
-Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed webhook (or poll) when the PDF is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
+One call returns the file: pass a public URL or raw HTML and get the PDF (or screenshot) bytes back in the same response — the server answers within about 45 seconds. For batches, webhook-driven pipelines and renders longer than that, the same endpoints run asynchronously: submit, get a job id back, and receive an HMAC-signed webhook (or poll) when the file is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
 
 ## Features
 
 - **TypeScript Native**: Full auto-complete and type safety for all endpoints.
 - **Dual Build**: ES Modules (ESM) and CommonJS (CJS) support.
 - **Zero Runtime Dependencies**: Uses native `fetch` (Node 18+, browsers, Edge).
-- **Auto Retry**: Automatic exponential backoff for `5xx` errors. A rate-limit or concurrency-limit `429` is waited out for the time the API states on every call — create, status and download — and so is a busy download (`download-busy`); quota `429`s are thrown at once, without a retry. Every create call carries an `Idempotency-Key` header — the `idempotencyKey` you pass, otherwise one generated per call and reused on every resend — so a retried create returns the original job instead of creating a second one.
+- **One Call, One File**: `urlToPdfFile` and the other `*File` methods send the job with `wait: true` and return the output bytes directly — no polling, no download step.
+- **Auto Retry**: The asynchronous methods retry `5xx` errors with exponential backoff. A rate-limit or concurrency-limit `429` is waited out for the time the API states on every call — create, status, download and the synchronous `*File` methods — and so is a busy download (`download-busy`); quota `429`s are thrown at once, without a retry. The `*File` methods never resend after a `504 SYNC_TIMEOUT`: the job was cancelled and not charged, and the retry is yours to decide. Every create call carries an `Idempotency-Key` header — the `idempotencyKey` you pass, otherwise one generated per call and reused on every resend — so a retried create returns the original job instead of creating a second one.
 - **DX Affordances**: Built-in polling logic (`waitForJob`) and binary download helpers.
 - **E-invoicing**: Factur-X / ZUGFeRD hybrid PDF/A-3 output — generated from your CII XML alone (`einvoiceToPdf`) or attached to your own render (the `einvoice` option).
 
@@ -28,7 +29,52 @@ pnpm add @pdfik/client
 
 ## Quick Start
 
-### Convert public URL to PDF
+### One call, one PDF
+
+```typescript
+import { writeFileSync } from 'fs';
+import { PdfikClient } from '@pdfik/client';
+
+const client = new PdfikClient({
+  apiKey: 'sk_live_YOUR_KEY' // Get your API key from the dashboard
+});
+
+const pdf = await client.urlToPdfFile('https://example.com');
+writeFileSync('page.pdf', pdf);
+```
+
+`urlToPdfFile` — and its siblings `htmlToPdfFile`, `markdownToPdfFile`, `urlToImageFile`, `htmlToImageFile` and `einvoiceToPdfFile` — sends the job with `wait: true`: the server holds the request and answers with the file itself, within about 45 seconds (the SDK sets no timers of its own). Each takes the same options as its asynchronous sibling below, minus `delivery` — with `wait` the response is the file, so there is nothing left to deliver to your own bucket and the server rejects the combination.
+
+Three answers are possible:
+
+- **The file** (`Uint8Array`) — the common case; most pages render in a few seconds. The file also stays downloadable for the normal 24 hours.
+- **A `PdfikError` with `errorCode: 'SYNC_TIMEOUT'`** (HTTP `503`) — the render did not finish in time. The job was cancelled and **not charged**, and its `Idempotency-Key` was released, so retrying is safe — but the SDK never resends it for you: the retry is yours to decide. (Rate-limit `429`s are still waited out automatically, as on every other call.) For renders this slow, submit without `wait` and use a webhook or polling.
+- **A `PdfikError` with the render's own error code** (HTTP `422`) — e.g. `PAGE_TIMEOUT` or `PAGE_NOT_FOUND`: the same codes a failed job status would show.
+
+```typescript
+import { writeFileSync } from 'fs';
+import { PdfikError } from '@pdfik/client';
+
+try {
+  const png = await client.urlToImageFile('https://example.com', {
+    options: { format: 'png', fullPage: true },
+  });
+  writeFileSync('page.png', png);
+} catch (e) {
+  if (e instanceof PdfikError && e.errorCode === 'SYNC_TIMEOUT') {
+    // Cancelled and not charged. Retry if you choose to — the SDK never
+    // retries a sync timeout for you — or submit without wait and poll.
+  } else {
+    throw e;
+  }
+}
+```
+
+A server from before synchronous mode ignores `wait` and answers `202` with a job id; the `*File` methods detect that and throw (the message names the job id so you can poll it) instead of handing the JSON back as file bytes.
+
+### Convert public URL to PDF (asynchronous)
+
+For batches, webhook-driven pipelines and renders longer than 45 seconds, submit the job and fetch the result when it is ready:
 
 ```typescript
 import { writeFileSync } from 'fs';
@@ -36,7 +82,7 @@ import { PdfikClient } from '@pdfik/client';
 
 // Initialize the client
 const client = new PdfikClient({
-  apiKey: 'sk_live_...' // Get your API key from the dashboard
+  apiKey: 'sk_live_YOUR_KEY' // Get your API key from the dashboard
 });
 
 async function generatePdf() {
@@ -277,6 +323,7 @@ constructor(config: { apiKey: string; baseUrl?: string })
 - **`urlToImage(url, opts)`**: Submits a job to capture a public URL as a PNG/JPEG screenshot. Returns a `JobCreatedResponse`.
 - **`htmlToImage(html, opts)`**: Submits a job to capture raw HTML markup as a PNG/JPEG screenshot. Returns a `JobCreatedResponse`.
 - **`einvoiceToPdf(xml, opts)`**: Submits a Factur-X e-invoice job — builds the human-readable invoice from your CII XML with a block template, renders to PDF/A-3 and embeds the XML as `factur-x.xml`. Returns a `JobCreatedResponse`.
+- **`urlToPdfFile(url, opts)` / `htmlToPdfFile(html, opts)` / `markdownToPdfFile(markdown, opts)` / `urlToImageFile(url, opts)` / `htmlToImageFile(html, opts)` / `einvoiceToPdfFile(xml, opts)`**: Synchronous variants of the six methods above — send the same request with `wait: true` and return the output file itself as a `Uint8Array` (the PDF, or PNG/JPEG bytes for the image methods); the server holds the request for up to ~45 s. Same `opts` as the corresponding method, minus `delivery`. On timeout they throw a `PdfikError` with `errorCode: 'SYNC_TIMEOUT'` (HTTP `504` — the job was cancelled and not charged; never resent by the SDK), and a failed render throws the job's own error code (HTTP `422`).
 - **`getJob(jobId)`**: Fetches the status of a specific job. Returns a `JobStatusResponse`.
 - **`waitForJob(jobId, opts)`**: Helper that polls `getJob` until the job is `done` or `failed`. Throws a `PdfikError` if the job fails or times out.
   - `opts.timeoutMs` (default: `120000` ms)

@@ -176,7 +176,12 @@ export class PdfikClient {
     method: string,
     body?: any,
     extraHeaders?: Record<string, string>,
-    throttled: (error: PdfikError) => boolean = isThrottled
+    throttled: (error: PdfikError) => boolean = isThrottled,
+    // The sync (`wait: true`) calls turn this off: their 503 means the server
+    // CANCELLED the job and released the Idempotency-Key, so a resend would
+    // not replay — it would render, and charge, a fresh job. Throttle waits
+    // (`throttled`) stay on either way; those resends are safe.
+    retry5xx: boolean = true
   ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
@@ -212,7 +217,7 @@ export class PdfikClient {
         continue;
       }
       attempt++;
-      if (attempt >= MAX_ATTEMPTS || error.statusCode < 500) {
+      if (!retry5xx || attempt >= MAX_ATTEMPTS || error.statusCode < 500) {
         throw error;
       }
       const delay = BACKOFF_INITIAL_MS * Math.pow(2, attempt - 1);
@@ -244,6 +249,51 @@ export class PdfikClient {
       // ignore JSON/text reading errors
     }
     return new PdfikError(message, response.status, errorCode, responseBody);
+  }
+
+  /**
+   * POSTs a create body with `wait: true` and returns the answered file bytes.
+   *
+   * Throttle 429s are waited out exactly as on an async create — the resend
+   * carries the same Idempotency-Key, so it attaches to the same request. Any
+   * other failure is thrown after ONE attempt (`retry5xx` off): a 503 means
+   * the server CANCELLED the job and released the key, so an automatic resend
+   * would start — and charge — a brand-new render of a page already known to
+   * be too slow, and a 422 is the render's own failure, which would only fail
+   * again. Whether to retry is the caller's decision.
+   */
+  private async requestFile(path: string, body: any, idempotencyKey?: string): Promise<Uint8Array> {
+    const res = await this.request(
+      path,
+      'POST',
+      { ...body, wait: true },
+      idempotencyHeader(idempotencyKey),
+      isThrottled,
+      false
+    );
+    // A server from before synchronous mode ignores the unknown `wait` field,
+    // queues the job and answers 202 JSON. Those bytes are a job receipt, not
+    // the file — returned as-is they would end up inside someone's page.pdf —
+    // so the mismatch is refused, with the job id needed to poll instead.
+    const contentType = res.headers?.get('content-type') || '';
+    if (res.status === 202 || contentType.includes('application/json')) {
+      let jobId: string | undefined;
+      let responseBody: string | undefined;
+      try {
+        responseBody = await res.text();
+        jobId = JSON.parse(responseBody)?.job_id;
+      } catch {
+        // an unreadable body changes nothing: the answer was not the file
+      }
+      throw new PdfikError(
+        `the server ignored wait: true — it predates synchronous mode; poll the job instead ` +
+          `(job ${jobId ?? 'unknown'}: waitForJob, then downloadPdf)`,
+        res.status,
+        'SYNC_MODE_UNSUPPORTED',
+        responseBody
+      );
+    }
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   /**
@@ -288,6 +338,41 @@ export class PdfikClient {
   }
 
   /**
+   * Renders a public URL and returns the PDF bytes in this one call: the body
+   * carries `wait: true`, so the server holds the request (up to ~45 s, no
+   * client-side timer) and answers with the file itself — no polling, no
+   * download step. The served stream consumes one of the job's 3 download
+   * attempts; the file also stays downloadable for the normal 24 h.
+   *
+   * `opts` are `urlToPdf`'s minus `delivery`: with `wait` the response IS the
+   * file, so there is nothing left to deliver to your own bucket and the
+   * server rejects the combination by design.
+   *
+   * A render too slow for the window is cancelled by the server and answered
+   * with 503 `SYNC_TIMEOUT` — the job was NOT charged and its Idempotency-Key
+   * was released, so retrying is safe, but it is YOUR call: the client never
+   * resends it (the same page would likely time out — and this time cost —
+   * again). A failed render is a 422 whose `errorCode` is the job's own
+   * (`PAGE_TIMEOUT`, `PAGE_NOT_FOUND`, …).
+   */
+  async urlToPdfFile(
+    url: string,
+    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; auth?: JobAuthOptions; einvoice?: EInvoiceOptions; idempotencyKey?: string; test?: boolean }
+  ): Promise<Uint8Array> {
+    validateRenderOptions(opts?.render);
+    const body = {
+      url,
+      webhookUrl: opts?.webhookUrl,
+      options: opts?.options,
+      render: opts?.render,
+      auth: opts?.auth,
+      einvoice: opts?.einvoice,
+      test: opts?.test,
+    };
+    return this.requestFile('/url-to-pdf', body, opts?.idempotencyKey);
+  }
+
+  /**
    * Submits a job to convert raw HTML markup to a PDF.
    *
    * Set `opts.test = true` to run the job in test mode: it goes through the
@@ -328,6 +413,29 @@ export class PdfikClient {
   }
 
   /**
+   * Renders raw HTML markup and returns the PDF bytes in this one call
+   * (`wait: true`). `opts` are `htmlToPdf`'s minus `delivery`; timeout (503
+   * `SYNC_TIMEOUT`, cancelled and not charged, never resent by the client)
+   * and render failure (422 with the job's own `errorCode`) behave exactly as
+   * on `urlToPdfFile`.
+   */
+  async htmlToPdfFile(
+    html: string,
+    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; einvoice?: EInvoiceOptions; idempotencyKey?: string; test?: boolean }
+  ): Promise<Uint8Array> {
+    validateRenderOptions(opts?.render);
+    const body = {
+      html,
+      webhookUrl: opts?.webhookUrl,
+      options: opts?.options,
+      render: opts?.render,
+      einvoice: opts?.einvoice,
+      test: opts?.test,
+    };
+    return this.requestFile('/html-to-pdf', body, opts?.idempotencyKey);
+  }
+
+  /**
    * Submits a job that converts Markdown (CommonMark + GFM tables and
    * strikethrough) to a PDF. Raw HTML inside the Markdown is escaped, not
    * rendered — use `htmlToPdf` for full HTML control. A built-in print
@@ -356,6 +464,28 @@ export class PdfikClient {
     const res = await this.request('/markdown-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
+  }
+
+  /**
+   * Converts Markdown and returns the PDF bytes in this one call
+   * (`wait: true`). `opts` are `markdownToPdf`'s minus `delivery`; timeout
+   * (503 `SYNC_TIMEOUT`, cancelled and not charged, never resent by the
+   * client) and render failure (422 with the job's own `errorCode`) behave
+   * exactly as on `urlToPdfFile`.
+   */
+  async markdownToPdfFile(
+    markdown: string,
+    opts?: { webhookUrl?: string; options?: PdfOptions; render?: RenderOptions; idempotencyKey?: string; test?: boolean }
+  ): Promise<Uint8Array> {
+    validateRenderOptions(opts?.render);
+    const body = {
+      markdown,
+      webhookUrl: opts?.webhookUrl,
+      options: opts?.options,
+      render: opts?.render,
+      test: opts?.test,
+    };
+    return this.requestFile('/markdown-to-pdf', body, opts?.idempotencyKey);
   }
 
   /**
@@ -391,6 +521,29 @@ export class PdfikClient {
   }
 
   /**
+   * Captures a public URL and returns the image bytes (PNG or JPEG, per
+   * `options.format`) in this one call (`wait: true`). `opts` are
+   * `urlToImage`'s minus `delivery`; timeout (503 `SYNC_TIMEOUT`, cancelled
+   * and not charged, never resent by the client) and render failure (422 with
+   * the job's own `errorCode`) behave exactly as on `urlToPdfFile`.
+   */
+  async urlToImageFile(
+    url: string,
+    opts?: { webhookUrl?: string; options?: ImageOptions; render?: RenderOptions; auth?: JobAuthOptions; idempotencyKey?: string; test?: boolean }
+  ): Promise<Uint8Array> {
+    validateRenderOptions(opts?.render);
+    const body = {
+      url,
+      webhookUrl: opts?.webhookUrl,
+      options: opts?.options,
+      render: opts?.render,
+      auth: opts?.auth,
+      test: opts?.test,
+    };
+    return this.requestFile('/url-to-image', body, opts?.idempotencyKey);
+  }
+
+  /**
    * Submits a job that captures raw HTML markup as an image (screenshot).
    *
    * `opts.options` controls the output: `format` 'png' (default) or 'jpeg',
@@ -418,6 +571,28 @@ export class PdfikClient {
     const res = await this.request('/html-to-image', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
+  }
+
+  /**
+   * Captures raw HTML markup and returns the image bytes (PNG or JPEG, per
+   * `options.format`) in this one call (`wait: true`). `opts` are
+   * `htmlToImage`'s minus `delivery`; timeout (503 `SYNC_TIMEOUT`, cancelled
+   * and not charged, never resent by the client) and render failure (422 with
+   * the job's own `errorCode`) behave exactly as on `urlToPdfFile`.
+   */
+  async htmlToImageFile(
+    html: string,
+    opts?: { webhookUrl?: string; options?: ImageOptions; render?: RenderOptions; idempotencyKey?: string; test?: boolean }
+  ): Promise<Uint8Array> {
+    validateRenderOptions(opts?.render);
+    const body = {
+      html,
+      webhookUrl: opts?.webhookUrl,
+      options: opts?.options,
+      render: opts?.render,
+      test: opts?.test,
+    };
+    return this.requestFile('/html-to-image', body, opts?.idempotencyKey);
   }
 
   /**
@@ -458,6 +633,30 @@ export class PdfikClient {
     const res = await this.request('/einvoice-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
     const data = await res.json();
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
+  }
+
+  /**
+   * Builds the Factur-X e-invoice and returns the PDF/A-3 bytes in this one
+   * call (`wait: true`). `opts` are `einvoiceToPdf`'s minus `delivery`;
+   * timeout (503 `SYNC_TIMEOUT`, cancelled and not charged, never resent by
+   * the client) and render failure (422 with the job's own `errorCode`, e.g.
+   * `EINVOICE_FAILED`) behave exactly as on `urlToPdfFile`. The async 202's
+   * minimum/basicwl profile note travels in the `X-PDFik-Warning` response
+   * header here — a file body has no `detail` field to carry it.
+   */
+  async einvoiceToPdfFile(
+    xml: string,
+    opts?: { profile?: EInvoiceProfile; templateId?: string; template?: Record<string, unknown>; webhookUrl?: string; idempotencyKey?: string; test?: boolean }
+  ): Promise<Uint8Array> {
+    const body = {
+      xml,
+      profile: opts?.profile,
+      templateId: opts?.templateId,
+      template: opts?.template,
+      webhookUrl: opts?.webhookUrl,
+      test: opts?.test,
+    };
+    return this.requestFile('/einvoice-to-pdf', body, opts?.idempotencyKey);
   }
 
   async getJob(jobId: string): Promise<JobStatusResponse> {

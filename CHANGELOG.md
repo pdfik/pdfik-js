@@ -4,6 +4,46 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-10-20
+
+The synchronous-mode release: one call in, the file out.
+
+### Added
+- Six synchronous methods: `urlToPdfFile`, `htmlToPdfFile`, `markdownToPdfFile`,
+  `urlToImageFile`, `htmlToImageFile`, `einvoiceToPdfFile`. Each takes the same arguments
+  as its create sibling — minus `delivery`, which the API rejects together with `wait` —
+  sends the body with `wait: true`, and resolves to the file itself as a `Uint8Array`
+  (the PDF, or the PNG/JPEG bytes for the image methods). The server holds the request
+  and answers within about 45 seconds; the client sets no timers of its own. No polling
+  and no download step, and the file stays downloadable for the normal 24 hours as well
+  (the sync answer consumes one of its 3 download attempts).
+- A `503` `SYNC_TIMEOUT` from a `*File` method is thrown after a single attempt, never
+  resent. The server cancelled the job, did not charge it and released its
+  `Idempotency-Key`, so an automatic resend would start — and charge — a brand-new render
+  of a page already known to be too slow; retrying, or resubmitting without `wait` and
+  using a webhook, is the caller's decision. The same single-attempt rule covers every
+  non-throttle failure of a `*File` call: a `422` carries the render's own error code
+  (`PAGE_TIMEOUT`, `PAGE_NOT_FOUND`, …) as `PdfikError.errorCode`, and other `5xx`s are
+  thrown as they come instead of being retried three times. Rate-limit and
+  concurrency-limit `429`s are still waited out exactly as on the asynchronous methods,
+  and every resend carries the same `Idempotency-Key`.
+- Old-server detection: a server from before synchronous mode ignores the unknown `wait`
+  field, queues the job and answers the usual `202` JSON. The `*File` methods recognise
+  that (a `202`, or a JSON content type on any `2xx`) and throw a `PdfikError` with
+  `errorCode: 'SYNC_MODE_UNSUPPORTED'` whose message names the created job id, so you can
+  poll it with `waitForJob` + `downloadPdf` — the JSON is never handed back as file bytes.
+- README: the quick start now opens with the one-call flow (`urlToPdfFile` →
+  `writeFileSync`); the asynchronous three-step flow stays as the path for batches,
+  webhooks and renders longer than 45 seconds. The Auto Retry feature line and the API
+  reference cover the `*File` methods.
+- Tests: the sync request body (`wait: true`, the `Idempotency-Key` header, no
+  `delivery`) on all six methods, the single-fetch `503`/`422`/`5xx` behaviour, the
+  throttle wait with the key held across the resend, and the old-server `202`/JSON
+  refusal with the job id in the message.
+
+### Changed
+- Version `0.4.2` → `0.5.0` (`package.json`, `package-lock.json`).
+
 ## [0.4.2] — 2026-10-12
 
 ### Fixed
