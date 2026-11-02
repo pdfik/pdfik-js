@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-20).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-02).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -11,7 +11,7 @@ One call returns the file: pass a public URL or raw HTML and get the PDF (or scr
 
 - **TypeScript Native**: Full auto-complete and type safety for all endpoints.
 - **Dual Build**: ES Modules (ESM) and CommonJS (CJS) support.
-- **Zero Runtime Dependencies**: Uses native `fetch` (Node 18+, browsers, Edge).
+- **Zero Runtime Dependencies**: Uses native `fetch` (Node 24+, browsers, Edge).
 - **One Call, One File**: `urlToPdfFile` and the other `*File` methods send the job with `wait: true` and return the output bytes directly — no polling, no download step.
 - **Auto Retry**: The asynchronous methods retry `5xx` errors with exponential backoff. A rate-limit or concurrency-limit `429` is waited out for the time the API states on every call — create, status, download and the synchronous `*File` methods — and so is a busy download (`download-busy`); quota `429`s are thrown at once, without a retry. The `*File` methods never resend after a `503 SYNC_TIMEOUT`: the job was cancelled and not charged, and the retry is yours to decide. Every create call carries an `Idempotency-Key` header — the `idempotencyKey` you pass, otherwise one generated per call and reused on every resend — so a retried create returns the original job instead of creating a second one.
 - **DX Affordances**: Built-in polling logic (`waitForJob`) and binary download helpers.
@@ -184,7 +184,7 @@ const imageBytes = await client.downloadPdf(job.jobId); // JPEG bytes
 const htmlShot = await client.htmlToImage('<h1>Hello</h1>'); // 1024x768 PNG
 ```
 
-`urlToImage` also accepts the Pro+ `auth` option (basic/bearer), exactly as `urlToPdf`. Passing `quality` together with PNG is rejected with `422`.
+`urlToImage` also accepts the `auth` option (basic/bearer), exactly as `urlToPdf`. Passing `quality` together with PNG is rejected with `422`.
 
 ## Deliver to your own bucket (BYOB)
 

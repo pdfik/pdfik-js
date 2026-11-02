@@ -111,7 +111,7 @@ function idempotencyHeader(key?: string): Record<string, string> {
 }
 
 /** A UUID v4, from whatever the runtime has. Web Crypto first (browsers, Edge,
- * Node 19+), then Node's own module (Node 18 has no global `crypto`). A browser
+ * Node), then Node's own module (kept for runtimes without a global `crypto`). A browser
  * bundle gets that module stubbed out, and a page served over plain http has no
  * `randomUUID`, so the last branch builds one by hand: the key only has to
  * differ from call to call, it is not a secret. */
@@ -497,7 +497,7 @@ export class PdfikClient {
    * the bytes with `downloadPdf` — for image jobs the download returns
    * `image/png` or `image/jpeg` instead of a PDF.
    *
-   * `opts.auth` (Pro+) attaches basic/bearer credentials exactly as on
+   * `opts.auth` attaches basic/bearer credentials exactly as on
    * `urlToPdf`. `opts.test` and `opts.delivery` behave as on the PDF
    * endpoints (and are not combinable with each other).
    */

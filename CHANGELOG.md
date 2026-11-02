@@ -4,6 +4,16 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-11-01
+
+No code changes.
+
+### Changed
+- Supported Node.js is now **24+** (declared in `engines`) — the current LTS with
+  current security fixes. Older Node lines (18 and 20 are EOL upstream) are no longer
+  promised or tested. Browsers and Edge runtimes are unaffected, and on Node 24
+  nothing changes.
+
 ## [0.5.0] — 2026-10-20
 
 The synchronous-mode release: one call in, the file out.
