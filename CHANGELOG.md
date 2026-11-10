@@ -4,6 +4,63 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-11-09
+
+### Fixed
+- `verifyWebhookSignature` checks every `v1` in `X-PDFik-Signature`. While the overlap
+  window of a secret rotation is open, PDFik signs each delivery with both secrets and
+  sends both signatures in the one header, the current secret's first:
+  `t=<unix seconds>,v1=<signature with the new secret>,v1=<signature with the previous secret>`.
+  The helper now accepts the delivery if any `v1` matches the secret you pass, comparing
+  each one in constant time. Up to 0.6.0 it read only the last `v1` — inside a window,
+  the previous secret's — so a receiver already switched to the new secret would reject
+  every genuine delivery until the window closed: upgrade before you rotate with an
+  overlap window. A header with a single `v1`, the ±300 s timestamp rule and the
+  `boolean` result are unchanged.
+- A signature whose `t` is not a number now fails verification. The ±300 s check
+  compared `NaN`, which never exceeds anything, so such a `t` skipped the window (the
+  HMAC still had to match).
+- `verifyWebhookSignature` finds `X-PDFik-Signature` and `X-PDFik-Timestamp` under any
+  spelling of the header name, as the Python, Java and C# helpers do. It knew only the
+  all-lowercase and the `X-PDFik-…` spellings, so a header map that kept another one —
+  `X-Pdfik-Signature`, as Go-based proxies write it — failed every genuine delivery.
+  `headers` that is `null` or `undefined` now gives `false` instead of a `TypeError`.
+- A request that gets no HTTP answer at all — DNS failure, refused or reset connection,
+  TLS error — or whose connection breaks while the answer's body is being read (a
+  download cut off halfway, a job receipt that never fully arrives) now rejects with a
+  `PdfikError`: `errorCode: 'NETWORK_ERROR'`, `statusCode: 503` (the status the Python,
+  Java and C# clients report a connection failure with) and a message carrying the
+  runtime's reason (for a host with several addresses, the reason from each address
+  tried), e.g.
+  `Connection failed: fetch failed (connect ECONNREFUSED 127.0.0.1:443)` or
+  `Connection failed: terminated (other side closed)`. It used to escape as the runtime's
+  own `TypeError: fetch failed` or `TypeError: terminated`, which an
+  `instanceof PdfikError` check did not catch, and it was never retried. The
+  asynchronous methods now retry it like a `5xx` — three attempts, 1 s and 2 s apart,
+  and a resent create carries the same `Idempotency-Key`, so it cannot create a second
+  job (a resent `downloadPdf` starts a new stream, which counts against the file's three
+  download attempts like any other); the `*File` methods throw it after their one
+  attempt, as they do every `5xx`. What fetch refuses before sending anything is not a
+  network failure: an `idempotencyKey` it cannot send as a header (a line break, or a
+  character above U+00FF) throws the runtime's `TypeError` at once, as in 0.6.0, and is
+  never resent.
+
+### Changed
+- The constructor throws a `TypeError` for a `baseUrl` that is not an absolute http(s)
+  URL (`api.pdfik.net` without `https://`, or `localhost:8000`) and for an `apiKey` that
+  cannot be sent as an HTTP header (a line break, or a character above U+00FF such as a
+  pasted smart quote or zero-width space); the message does not quote the key. Up to
+  0.6.0 such a client was created and every call then failed with the runtime's own
+  `TypeError`.
+- README: "Handling Webhooks" says deliveries are signed once a signing secret has been
+  generated (unsigned until then) and describes the signature header, the ±300 s rule and
+  the two signatures of a rotation window (it used to advise checking the new secret and
+  then the old one yourself); the Auto Retry line covers network failures; the
+  constructor reference names its `TypeError`; the `verifyWebhookSignature` reference
+  says what it accepts.
+- Version `0.6.0` → `0.7.0` (`package.json`; `package-lock.json`, whose root entries had
+  been left at `0.5.0`).
+
 ## [0.6.0] — 2026-11-01
 
 No code changes.

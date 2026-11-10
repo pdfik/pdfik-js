@@ -126,6 +126,61 @@ function newUuid(): string {
   });
 }
 
+/** The PdfikError a network failure is reported as, instead of the runtime's own
+ * error: a request that got no HTTP answer at all — DNS failure, refused or reset
+ * connection, TLS error (Node's bare `TypeError: fetch failed`) — or an answer
+ * whose connection broke while its body was being read (`TypeError: terminated`).
+ * Status 503, as the Python, Java and C# clients report it, so the retry policy
+ * treats it exactly like a 5xx answer. */
+function networkError(failure: unknown): PdfikError {
+  const reason = failureText(failure) || String(failure);
+  // Node keeps the actual reason (ENOTFOUND, ECONNREFUSED, a TLS failure, a socket
+  // closed mid-body) on `cause` — for a host with several addresses (IPv6 and IPv4,
+  // several A records) an AggregateError whose own message is EMPTY and whose
+  // `errors` hold one reason per address tried.
+  const why = failure !== null && typeof failure === 'object' ? failureText((failure as { cause?: unknown }).cause) : '';
+  return new PdfikError(`Connection failed: ${why ? `${reason} (${why})` : reason}`, 503, 'NETWORK_ERROR');
+}
+
+/** The text of an error-like value: its message; else the messages its `errors`
+ * collect (an AggregateError's own message is empty); else its code. Read by shape,
+ * not `instanceof`: under a vm sandbox (Jest) fetch's errors come from another
+ * realm, where `instanceof Error` is false. */
+function failureText(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'object') return String(value);
+  const { message, errors, code } = value as { message?: unknown; errors?: unknown; code?: unknown };
+  if (typeof message === 'string' && message) return message;
+  if (Array.isArray(errors)) {
+    const each = errors
+      .map((e) => (e !== null && typeof e === 'object' ? (e as { message?: unknown }).message : undefined))
+      .filter((m): m is string => typeof m === 'string' && m !== '');
+    if (each.length) return each.join('; ');
+  }
+  return typeof code === 'string' ? code : '';
+}
+
+/** `fetch`, except that a request which got no HTTP answer resolves to its
+ * `networkError` instead of rejecting. What fetch refuses before sending anything
+ * is the caller's input, not a network failure: fetch starts by building a Request
+ * from (url, init), which throws a TypeError for a header value with CR/LF or a
+ * character above U+00FF (a caller's `idempotencyKey`). Built here, outside the
+ * try, that TypeError surfaces unchanged and is never resent. */
+async function send(url: string, init: RequestInit): Promise<Response | PdfikError> {
+  new Request(url, init);
+  try {
+    return await fetch(url, init);
+  } catch (failure) {
+    return networkError(failure);
+  }
+}
+
+/** The body of a successful answer as JSON, and as bytes. `request` calls these
+ * inside its retry loop: the body arrives after the headers, so a connection can
+ * still break here. */
+const readJson = (response: Response): Promise<any> => response.json();
+const readBytes = async (response: Response): Promise<Uint8Array> => new Uint8Array(await response.arrayBuffer());
+
 /** Milliseconds to wait after a 429: the API's `retry_after_seconds`, else its
  * `Retry-After` header in seconds (either one capped), else `fallbackMs`. */
 function throttleDelayMs(error: PdfikError, fallbackMs: number, headers?: Headers): number {
@@ -169,11 +224,33 @@ export class PdfikClient {
     }
     this.apiKey = config.apiKey;
     this.baseUrl = (config.baseUrl || 'https://api.pdfik.net').replace(/\/$/, '');
+    // A configuration fetch cannot send is the caller's mistake, not the network's:
+    // thrown here, at once, instead of failing every call later as a NETWORK_ERROR
+    // that is resent twice. `new URL` alone accepts 'localhost:8000' (scheme "localhost:").
+    let protocol = '';
+    try {
+      protocol = new URL(this.baseUrl).protocol;
+    } catch {
+      // not an absolute URL
+    }
+    if (protocol !== 'https:' && protocol !== 'http:') {
+      throw new TypeError(`baseUrl must be an absolute http(s) URL such as https://api.pdfik.net, not "${this.baseUrl}"`);
+    }
+    try {
+      new Headers({ 'X-API-Key': this.apiKey });
+    } catch {
+      // Not the runtime's own message: that one quotes the key.
+      throw new TypeError(
+        'apiKey cannot be sent as an HTTP header: it contains a line break, a NUL or a character above U+00FF (a pasted smart quote or zero-width space?)'
+      );
+    }
   }
 
-  private async request(
+  /** Sends the request and returns its successful answer's body, as `read` reads it. */
+  private async request<T>(
     path: string,
     method: string,
+    read: (response: Response) => Promise<T>,
     body?: any,
     extraHeaders?: Record<string, string>,
     throttled: (error: PdfikError) => boolean = isThrottled,
@@ -182,7 +259,7 @@ export class PdfikClient {
     // not replay — it would render, and charge, a fresh job. Throttle waits
     // (`throttled`) stay on either way; those resends are safe.
     retry5xx: boolean = true
-  ): Promise<Response> {
+  ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
       'X-API-Key': this.apiKey,
@@ -205,16 +282,33 @@ export class PdfikClient {
     let attempt = 0;
     let throttleWaits = 0;
     while (true) {
-      const response = await fetch(url, fetchOptions);
-      if (response.ok) {
-        return response;
-      }
-      const error = await this.errorFrom(response);
-      if (throttled(error) && throttleWaits < THROTTLE_WAITS) {
-        throttleWaits++;
-        const delay = throttleDelayMs(error, RETRY_AFTER_FALLBACK_MS, response.headers);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        continue;
+      const response = await send(url, fetchOptions);
+      let error: PdfikError;
+      if (response instanceof PdfikError) {
+        // No HTTP answer: counted and retried like a 5xx — a resent create
+        // carries the same Idempotency-Key — and, like one, thrown at once
+        // when `retry5xx` is off.
+        error = response;
+      } else if (response.ok) {
+        try {
+          return await read(response);
+        } catch (failure) {
+          // `read`'s own PdfikError, and a body that arrived whole but is not
+          // JSON (SyntaxError — matched by name: like fetch's own errors it can
+          // come from another realm), are answers. Anything else means the
+          // connection broke mid-body: the same network failure as no answer at
+          // all, so it is counted and resent, or thrown, exactly like one.
+          if (failure instanceof PdfikError || (failure as { name?: unknown } | null)?.name === 'SyntaxError') throw failure;
+          error = networkError(failure);
+        }
+      } else {
+        error = await this.errorFrom(response);
+        if (throttled(error) && throttleWaits < THROTTLE_WAITS) {
+          throttleWaits++;
+          const delay = throttleDelayMs(error, RETRY_AFTER_FALLBACK_MS, response.headers);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
       }
       attempt++;
       if (!retry5xx || attempt >= MAX_ATTEMPTS || error.statusCode < 500) {
@@ -263,37 +357,34 @@ export class PdfikClient {
    * again. Whether to retry is the caller's decision.
    */
   private async requestFile(path: string, body: any, idempotencyKey?: string): Promise<Uint8Array> {
-    const res = await this.request(
-      path,
-      'POST',
-      { ...body, wait: true },
-      idempotencyHeader(idempotencyKey),
-      isThrottled,
-      false
-    );
-    // A server from before synchronous mode ignores the unknown `wait` field,
-    // queues the job and answers 202 JSON. Those bytes are a job receipt, not
-    // the file — returned as-is they would end up inside someone's page.pdf —
-    // so the mismatch is refused, with the job id needed to poll instead.
-    const contentType = res.headers?.get('content-type') || '';
-    if (res.status === 202 || contentType.includes('application/json')) {
-      let jobId: string | undefined;
-      let responseBody: string | undefined;
-      try {
-        responseBody = await res.text();
-        jobId = JSON.parse(responseBody)?.job_id;
-      } catch {
-        // an unreadable body changes nothing: the answer was not the file
+    // The file is read inside `request`, so a connection that breaks mid-body is
+    // a NETWORK_ERROR — thrown after this one attempt like every other failure.
+    const readFile = async (res: Response): Promise<Uint8Array> => {
+      // A server from before synchronous mode ignores the unknown `wait` field,
+      // queues the job and answers 202 JSON. Those bytes are a job receipt, not
+      // the file — returned as-is they would end up inside someone's page.pdf —
+      // so the mismatch is refused, with the job id needed to poll instead.
+      const contentType = res.headers?.get('content-type') || '';
+      if (res.status === 202 || contentType.includes('application/json')) {
+        let jobId: string | undefined;
+        let responseBody: string | undefined;
+        try {
+          responseBody = await res.text();
+          jobId = JSON.parse(responseBody)?.job_id;
+        } catch {
+          // an unreadable body changes nothing: the answer was not the file
+        }
+        throw new PdfikError(
+          `the server ignored wait: true — it predates synchronous mode; poll the job instead ` +
+            `(job ${jobId ?? 'unknown'}: waitForJob, then downloadPdf)`,
+          res.status,
+          'SYNC_MODE_UNSUPPORTED',
+          responseBody
+        );
       }
-      throw new PdfikError(
-        `the server ignored wait: true — it predates synchronous mode; poll the job instead ` +
-          `(job ${jobId ?? 'unknown'}: waitForJob, then downloadPdf)`,
-        res.status,
-        'SYNC_MODE_UNSUPPORTED',
-        responseBody
-      );
-    }
-    return new Uint8Array(await res.arrayBuffer());
+      return readBytes(res);
+    };
+    return this.request(path, 'POST', readFile, { ...body, wait: true }, idempotencyHeader(idempotencyKey), isThrottled, false);
   }
 
   /**
@@ -332,8 +423,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const res = await this.request('/url-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
-    const data = await res.json();
+    const data = await this.request('/url-to-pdf', 'POST', readJson, body, idempotencyHeader(opts?.idempotencyKey));
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
 
@@ -407,8 +497,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const res = await this.request('/html-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
-    const data = await res.json();
+    const data = await this.request('/html-to-pdf', 'POST', readJson, body, idempotencyHeader(opts?.idempotencyKey));
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
 
@@ -461,8 +550,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const res = await this.request('/markdown-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
-    const data = await res.json();
+    const data = await this.request('/markdown-to-pdf', 'POST', readJson, body, idempotencyHeader(opts?.idempotencyKey));
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
 
@@ -515,8 +603,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const res = await this.request('/url-to-image', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
-    const data = await res.json();
+    const data = await this.request('/url-to-image', 'POST', readJson, body, idempotencyHeader(opts?.idempotencyKey));
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
 
@@ -568,8 +655,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const res = await this.request('/html-to-image', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
-    const data = await res.json();
+    const data = await this.request('/html-to-image', 'POST', readJson, body, idempotencyHeader(opts?.idempotencyKey));
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
 
@@ -630,8 +716,7 @@ export class PdfikClient {
       delivery: normalizeDelivery(opts?.delivery),
       test: opts?.test,
     };
-    const res = await this.request('/einvoice-to-pdf', 'POST', body, idempotencyHeader(opts?.idempotencyKey));
-    const data = await res.json();
+    const data = await this.request('/einvoice-to-pdf', 'POST', readJson, body, idempotencyHeader(opts?.idempotencyKey));
     return mapKeys(data, snakeToCamel) as JobCreatedResponse;
   }
 
@@ -660,8 +745,7 @@ export class PdfikClient {
   }
 
   async getJob(jobId: string): Promise<JobStatusResponse> {
-    const res = await this.request(`/jobs/${jobId}`, 'GET');
-    const data = await res.json();
+    const data = await this.request(`/jobs/${jobId}`, 'GET', readJson);
     return mapKeys(data, snakeToCamel) as JobStatusResponse;
   }
 
@@ -679,8 +763,8 @@ export class PdfikClient {
         // No waiting inside the request while polling: a 429 is thrown at once
         // and waited out below, where `timeoutMs` is checked, so the caller's
         // timeout stays in charge.
-        const res = await this.request(`/jobs/${jobId}`, 'GET', undefined, undefined, () => false);
-        job = mapKeys(await res.json(), snakeToCamel) as JobStatusResponse;
+        const data = await this.request(`/jobs/${jobId}`, 'GET', readJson, undefined, undefined, () => false);
+        job = mapKeys(data, snakeToCamel) as JobStatusResponse;
       } catch (error) {
         // A 429 while polling is a throttle, not a failure: on Free (10
         // requests/min) a render longer than ~20 s used to end the wait with an
@@ -733,40 +817,60 @@ export class PdfikClient {
    * download attempt). `429` download-attempts-exhausted is thrown at once.
    */
   async downloadPdf(jobId: string): Promise<Uint8Array> {
-    const res = await this.request(`/jobs/${jobId}/download`, 'GET', undefined, undefined, isDownloadThrottled);
-    const buffer = await res.arrayBuffer();
-    return new Uint8Array(buffer);
+    return this.request(`/jobs/${jobId}/download`, 'GET', readBytes, undefined, undefined, isDownloadThrottled);
   }
 
+  /**
+   * Verifies a webhook delivery: `X-PDFik-Signature` is
+   * `t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`, and `t` must be
+   * within ±300 s of now. While a rotated-out secret is still inside its overlap
+   * window the header carries one `v1` per secret — `t=…,v1=<new>,v1=<previous>` —
+   * so every `v1` is checked and the delivery is genuine if ANY of them matches
+   * `webhookSecret`. Pass the raw body exactly as received, never re-serialized JSON.
+   * Header names are matched in any case; missing headers, or `headers` that is not
+   * an object at all, give `false`.
+   */
   public static verifyWebhookSignature(
     rawBody: string,
     headers: Record<string, string | string[] | undefined>,
     webhookSecret: string
   ): boolean {
-    const signatureHeader = (headers['x-pdfik-signature'] || headers['X-PDFik-Signature']) as string | undefined;
-    const timestampHeader = (headers['x-pdfik-timestamp'] || headers['X-PDFik-Timestamp']) as string | undefined;
+    // Header names are case-insensitive. Node lowercases them, but a map that keeps
+    // the spelling it received — re-cased on the way, e.g. Go's X-Pdfik-Signature —
+    // must not reject a genuine delivery. Same as the Python, Java and C# helpers.
+    const header = (name: string): string | undefined => {
+      if (headers === null || typeof headers !== 'object') return undefined;
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === name && headers[key]) return headers[key] as string;
+      }
+      return undefined;
+    };
+    const signatureHeader = header('x-pdfik-signature');
+    const timestampHeader = header('x-pdfik-timestamp');
 
     if (!signatureHeader || !timestampHeader) {
       return false;
     }
 
     try {
-      const parts = Object.fromEntries(
-        signatureHeader.split(',').map((p) => {
-          const eqIdx = p.indexOf('=');
-          if (eqIdx === -1) return [p, ''];
-          return [p.substring(0, eqIdx).trim(), p.substring(eqIdx + 1).trim()];
-        })
-      );
-      const timestamp = parts['t'];
-      const receivedSig = parts['v1'];
+      let timestamp: string | undefined;
+      const receivedSigs: string[] = [];
+      for (const part of signatureHeader.split(',')) {
+        const eqIdx = part.indexOf('=');
+        if (eqIdx === -1) continue;
+        const key = part.substring(0, eqIdx).trim();
+        const value = part.substring(eqIdx + 1).trim();
+        if (key === 't') timestamp = value;
+        else if (key === 'v1' && value) receivedSigs.push(value);
+      }
 
-      if (!timestamp || !receivedSig) {
+      if (!timestamp || receivedSigs.length === 0) {
         return false;
       }
 
+      // A `t` that is not a number is outside every window (NaN compares false).
       const now = Math.floor(Date.now() / 1000);
-      if (Math.abs(now - Number(timestamp)) > 300) {
+      if (!(Math.abs(now - Number(timestamp)) <= 300)) {
         return false;
       }
 
@@ -776,12 +880,16 @@ export class PdfikClient {
         .update(signedPayload)
         .digest('hex');
 
+      // Every candidate is compared, each in constant time.
       const expectedBuffer = Buffer.from(expectedSig);
-      const receivedBuffer = Buffer.from(receivedSig);
-      if (expectedBuffer.length !== receivedBuffer.length) {
-        return false;
+      let matched = false;
+      for (const receivedSig of receivedSigs) {
+        const receivedBuffer = Buffer.from(receivedSig);
+        if (receivedBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {
+          matched = true;
+        }
       }
-      return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+      return matched;
     } catch {
       return false;
     }

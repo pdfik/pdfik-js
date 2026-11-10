@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-02).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-10).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -13,7 +13,7 @@ One call returns the file: pass a public URL or raw HTML and get the PDF (or scr
 - **Dual Build**: ES Modules (ESM) and CommonJS (CJS) support.
 - **Zero Runtime Dependencies**: Uses native `fetch` (Node 24+, browsers, Edge).
 - **One Call, One File**: `urlToPdfFile` and the other `*File` methods send the job with `wait: true` and return the output bytes directly — no polling, no download step.
-- **Auto Retry**: The asynchronous methods retry `5xx` errors with exponential backoff. A rate-limit or concurrency-limit `429` is waited out for the time the API states on every call — create, status, download and the synchronous `*File` methods — and so is a busy download (`download-busy`); quota `429`s are thrown at once, without a retry. The `*File` methods never resend after a `503 SYNC_TIMEOUT`: the job was cancelled and not charged, and the retry is yours to decide. Every create call carries an `Idempotency-Key` header — the `idempotencyKey` you pass, otherwise one generated per call and reused on every resend — so a retried create returns the original job instead of creating a second one.
+- **Auto Retry**: The asynchronous methods retry `5xx` errors and network failures with exponential backoff (3 attempts). A request that gets no HTTP answer at all — DNS failure, refused or reset connection, TLS error — or whose connection breaks while the body is being read is reported as a `PdfikError` with `errorCode: 'NETWORK_ERROR'` and `statusCode: 503`. A rate-limit or concurrency-limit `429` is waited out for the time the API states on every call — create, status, download and the synchronous `*File` methods — and so is a busy download (`download-busy`); quota `429`s are thrown at once, without a retry. The `*File` methods never resend after a `5xx` or a network failure, and in particular not after a `503 SYNC_TIMEOUT`: the job was cancelled and not charged, and the retry is yours to decide. Every create call carries an `Idempotency-Key` header — the `idempotencyKey` you pass, otherwise one generated per call and reused on every resend — so a retried create returns the original job instead of creating a second one.
 - **DX Affordances**: Built-in polling logic (`waitForJob`) and binary download helpers.
 - **E-invoicing**: Factur-X / ZUGFeRD hybrid PDF/A-3 output — generated from your CII XML alone (`einvoiceToPdf`) or attached to your own render (the `einvoice` option).
 
@@ -264,9 +264,19 @@ If you specify `webhookUrl` in the options of `urlToPdf` or `htmlToPdf`, PDFik w
 
 You should verify the authenticity of the webhook by validating the signature. We provide a static helper `verifyWebhookSignature` in `PdfikClient` for this purpose.
 
-During a secret rotation both the new and the previous secret verify for the overlap
-window you pick in the dashboard (1 hour to 5 days, or none at all), so check the new
-one first and fall back to the old one while you roll your receivers out.
+Deliveries are signed once you generate a signing secret on the dashboard's Webhooks
+page (every plan, Free included); until then — or after you delete the secret — they
+arrive without the `X-PDFik-Signature` and `X-PDFik-Timestamp` headers, and
+`verifyWebhookSignature` returns `false` for them. While a secret is set, every delivery
+carries `X-PDFik-Signature: t=<unix seconds>,v1=<signature>` — the
+hex HMAC-SHA256 of `<t>.<raw body>` under your webhook secret — and `X-PDFik-Timestamp`;
+a `t` more than 300 seconds away from now is rejected. When you rotate the secret with
+an overlap window (picked in the dashboard: 1 hour to 5 days, or none at all), every
+delivery inside the window is signed with both secrets, current first:
+`t=<unix seconds>,v1=<signature with the new secret>,v1=<signature with the previous secret>`.
+`verifyWebhookSignature` accepts a delivery if any `v1` matches the secret you pass, so
+a receiver still holding the previous secret keeps working — switch each receiver to the
+new secret before the window closes.
 
 Custom delivery headers (e.g. a Cloudflare Access service token) are configured once on
 the dashboard Webhooks page and attached to every delivery — nothing to pass per request.
@@ -315,6 +325,8 @@ app.listen(3000, () => console.log('Webhook server running on port 3000'));
 constructor(config: { apiKey: string; baseUrl?: string })
 ```
 
+The constructor throws a `TypeError` when `baseUrl` is not an absolute http(s) URL, or when `apiKey` cannot be sent as an HTTP header (a line break, or a character above U+00FF such as a pasted smart quote).
+
 #### Methods
 
 - **`urlToPdf(url, opts)`**: Submits a job to convert a public URL to a PDF. Returns a `JobCreatedResponse`.
@@ -330,7 +342,7 @@ constructor(config: { apiKey: string; baseUrl?: string })
   - `opts.pollIntervalMs` (default: `2000` ms)
 - **`getFileUrl(jobId)`**: Returns the direct download URL for the PDF (requires the "X-API-Key" header).
 - **`downloadPdf(jobId)`**: Downloads and returns the output file as a `Uint8Array` — the PDF, or for image jobs the raw PNG/JPEG bytes.
-- **`verifyWebhookSignature(rawBody, headers, webhookSecret)`**: **(Static)** Verifies the webhook HMAC-SHA256 signature using the raw request body and request headers. Returns `boolean`.
+- **`verifyWebhookSignature(rawBody, headers, webhookSecret)`**: **(Static)** Verifies the webhook HMAC-SHA256 signature using the raw request body and request headers (header names in any case): `true` when any `v1` in `X-PDFik-Signature` matches `webhookSecret` and its `t` is within ±300 s of now. Returns `boolean`.
 
 ## License
 

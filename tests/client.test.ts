@@ -1,3 +1,5 @@
+import { createHmac } from 'crypto';
+import { runInNewContext } from 'vm';
 import { PdfikClient } from '../src/client';
 import { PdfikError } from '../src/errors';
 
@@ -1086,6 +1088,253 @@ describe('PdfikClient', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  // How Node's fetch rejects a request that got no HTTP answer at all: a bare
+  // TypeError, with the actual reason on `cause`.
+  const fetchFailed = () =>
+    Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') });
+
+  test('a request that gets no HTTP answer is a NETWORK_ERROR PdfikError, retried like a 5xx', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockRejectedValue(fetchFailed());
+    const sleeps = recordSleeps();
+
+    const failure = client.getJob('job-123');
+
+    await expect(failure).rejects.toBeInstanceOf(PdfikError);
+    await expect(failure).rejects.toMatchObject({
+      statusCode: 503,
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: fetch failed (connect ECONNREFUSED 127.0.0.1:443)',
+    });
+    expect(sleeps).toEqual([1000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('a refusal from every address of a host keeps each address reason in the message', async () => {
+    // A host with several addresses (localhost = ::1 + 127.0.0.1, IPv6 + IPv4, several
+    // A records): Node tries each one, and the cause is an AggregateError whose own
+    // message is EMPTY, the reasons in `errors`. (Not the bare identifier: TS2304
+    // under this tsconfig's ES2020 lib.)
+    const everyAddress = Object.assign(
+      new (globalThis as any).AggregateError(
+        [new Error('connect ECONNREFUSED ::1:443'), new Error('connect ECONNREFUSED 127.0.0.1:443')],
+        ''
+      ),
+      { code: 'ECONNREFUSED' }
+    );
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: everyAddress }));
+    recordSleeps();
+
+    await expect(client.getJob('job-123')).rejects.toMatchObject({
+      statusCode: 503,
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: fetch failed (connect ECONNREFUSED ::1:443; connect ECONNREFUSED 127.0.0.1:443)',
+    });
+  });
+
+  test('a cause with neither a message nor errors is named by its code', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockRejectedValue(
+      Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(''), { code: 'ECONNRESET' }) })
+    );
+    recordSleeps();
+
+    await expect(client.getJob('job-123')).rejects.toMatchObject({
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: fetch failed (ECONNRESET)',
+    });
+  });
+
+  test('a network failure from another realm keeps its message and its cause', async () => {
+    // Under a vm sandbox (Jest itself) fetch's errors come from Node's realm, where
+    // `instanceof Error` is false for this one.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockRejectedValue(
+      runInNewContext("Object.assign(new TypeError('fetch failed'), { cause: new Error('connect ECONNREFUSED 127.0.0.1:443') })")
+    );
+    recordSleeps();
+
+    await expect(client.getJob('job-123')).rejects.toMatchObject({
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: fetch failed (connect ECONNREFUSED 127.0.0.1:443)',
+    });
+  });
+
+  test('a create resent after a network failure succeeds and carries the same Idempotency-Key', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockRejectedValueOnce(fetchFailed()).mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    const job = await client.urlToPdf('https://example.com');
+
+    expect(job.jobId).toBe('job-123');
+    expect(sleeps).toEqual([1000]);
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys[1]).toBe(sentKeys[0]);
+  });
+
+  // How Node's fetch fails a body read when the connection breaks after the
+  // headers arrived: TypeError 'terminated', the socket's reason on `cause`.
+  const bodyBrokeOff = () => Object.assign(new TypeError('terminated'), { cause: new Error('other side closed') });
+
+  test('a download whose body breaks off is a NETWORK_ERROR PdfikError, retried like a 5xx', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      arrayBuffer: () => Promise.reject(new TypeError('terminated')),
+    });
+    const sleeps = recordSleeps();
+
+    const failure = client.downloadPdf('job-123');
+
+    await expect(failure).rejects.toBeInstanceOf(PdfikError);
+    await expect(failure).rejects.toMatchObject({
+      statusCode: 503,
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: terminated',
+    });
+    expect(sleeps).toEqual([1000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('a JSON answer whose body breaks off is a NETWORK_ERROR PdfikError, retried like a 5xx', async () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: () => Promise.reject(bodyBrokeOff()),
+    });
+    const sleeps = recordSleeps();
+
+    const failure = client.getJob('job-123');
+
+    await expect(failure).rejects.toBeInstanceOf(PdfikError);
+    await expect(failure).rejects.toMatchObject({
+      statusCode: 503,
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: terminated (other side closed)',
+    });
+    expect(sleeps).toEqual([1000, 2000]);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('a complete 200 whose body is not JSON is an answer, not a NETWORK_ERROR: no resend, the SyntaxError surfaces', async () => {
+    // The body arrived whole; sending the request again would only fetch the same bytes.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: () => Promise.reject(new SyntaxError('Unexpected token < in JSON at position 0')),
+    });
+    const sleeps = recordSleeps();
+
+    const failure = client.getJob('job-123');
+
+    await expect(failure).rejects.toBeInstanceOf(SyntaxError);
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a non-JSON 200 whose SyntaxError comes from another realm is still an answer: no resend', async () => {
+    // A real Response parses its JSON in Node's realm, outside a vm sandbox (Jest).
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: () => Promise.reject(runInNewContext("new SyntaxError('Unexpected token < in JSON at position 0')")),
+    });
+    const sleeps = recordSleeps();
+
+    await expect(client.getJob('job-123')).rejects.toMatchObject({ name: 'SyntaxError' });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a create whose answer breaks off mid-body is resent with the same Idempotency-Key', async () => {
+    // The job already exists when its 202 breaks off; the resend's key makes
+    // the API answer with that same job instead of creating a second one.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch
+      .mockResolvedValueOnce({ ok: true, status: 202, headers: new Headers(), json: () => Promise.reject(bodyBrokeOff()) })
+      .mockResolvedValueOnce(jobCreated);
+    const sleeps = recordSleeps();
+
+    const job = await client.urlToPdf('https://example.com');
+
+    expect(job.jobId).toBe('job-123');
+    expect(sleeps).toEqual([1000]);
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[0]).toMatch(UUID_V4);
+    expect(sentKeys[1]).toBe(sentKeys[0]);
+  });
+
+  // A configuration fetch cannot send is the caller's mistake, never a NETWORK_ERROR.
+  // The error is matched by name, not instanceof: fetch's own TypeErrors come from
+  // Node's realm, not from Jest's sandbox.
+  const thrownBy = (construct: () => unknown): unknown => {
+    try {
+      construct();
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  };
+
+  test('a baseUrl that is not an absolute http(s) URL is refused by the constructor, before any request', () => {
+    // 'localhost:8000' parses as a URL whose scheme is "localhost:"; fetch would
+    // only answer "fetch failed (unknown scheme)".
+    for (const baseUrl of ['api.pdfik.net', 'localhost:8000', 'ftp://api.pdfik.net']) {
+      expect(thrownBy(() => new PdfikClient({ apiKey: 'sk_test_123', baseUrl }))).toMatchObject({
+        name: 'TypeError',
+        message: `baseUrl must be an absolute http(s) URL such as https://api.pdfik.net, not "${baseUrl}"`,
+      });
+    }
+    for (const baseUrl of ['http://localhost:8000/', 'https://api-staging.pdfik.net']) {
+      expect(thrownBy(() => new PdfikClient({ apiKey: 'sk_test_123', baseUrl }))).toBeUndefined();
+    }
+  });
+
+  test.each([
+    ['a line break', 'sk_live_abc\ndef'],
+    ['a zero-width space', 'sk_live_abc\u200b'],
+    ['a smart quote', '“sk_live_abc”'],
+  ])('an apiKey with %s is refused by the constructor, without quoting the key', (_, apiKey) => {
+    const error = thrownBy(() => new PdfikClient({ apiKey }));
+    expect(error).toMatchObject({ name: 'TypeError', message: expect.stringMatching(/^apiKey cannot be sent as an HTTP header/) });
+    expect((error as Error).message).not.toContain('sk_live_abc');
+  });
+
+  test.each([
+    ['a line break', 'order\r\n42', /invalid header value/],
+    ['a character above U+00FF', 'зам-1', /ByteString/],
+  ])(
+    'an idempotencyKey with %s throws the runtime TypeError at once: no NETWORK_ERROR, nothing sent, nothing resent',
+    async (_, idempotencyKey, refusal) => {
+      const client = new PdfikClient({ apiKey: 'sk_test_123' });
+      // Real fetch starts by building a Request and rejects with what that throws;
+      // the mock does the same.
+      mockFetch.mockImplementation(async (url: string, init: RequestInit) => {
+        new Request(url, init);
+        return jobCreated;
+      });
+      const sleeps = recordSleeps();
+
+      await expect(client.urlToPdf('https://example.com', { idempotencyKey })).rejects.toMatchObject({
+        name: 'TypeError',
+        message: expect.stringMatching(refusal),
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(sleeps).toEqual([]);
+    }
+  );
+
   test('a throttle wait does not use up one of the three 5xx attempts', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
     mockFetch
@@ -1398,6 +1647,43 @@ describe('PdfikClient', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  test('a network failure on a *File call is thrown at once as NETWORK_ERROR, never resent', async () => {
+    // The held render may already have run (and been charged) when the
+    // connection dropped, so the sync call never resends it — as for a 5xx.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockRejectedValue(fetchFailed());
+    const sleeps = recordSleeps();
+
+    await expect(client.urlToPdfFile('https://example.com')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 503,
+      errorCode: 'NETWORK_ERROR',
+    });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a *File answer whose body breaks off is a NETWORK_ERROR thrown at once, never resent', async () => {
+    // The render ran and was charged before the file started to arrive.
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/pdf', 'x-pdfik-job-id': 'job-sync-1' }),
+      arrayBuffer: () => Promise.reject(bodyBrokeOff()),
+    });
+    const sleeps = recordSleeps();
+
+    await expect(client.urlToPdfFile('https://example.com')).rejects.toMatchObject({
+      name: 'PdfikError',
+      statusCode: 503,
+      errorCode: 'NETWORK_ERROR',
+      message: 'Connection failed: terminated (other side closed)',
+    });
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
   test('a plain 5xx on a *File call is thrown at once, unlike on the async methods', async () => {
     // A sync call cannot tell a gateway's own 5xx from one that cut a live
     // render; resending blind could render — and charge — twice, so the
@@ -1480,5 +1766,85 @@ describe('PdfikClient', () => {
 
     const missingHeaders = PdfikClient.verifyWebhookSignature(rawBody, {}, webhookSecret);
     expect(missingHeaders).toBe(false);
+  });
+
+  describe('verifyWebhookSignature during a secret rotation', () => {
+    // While the previous secret is inside its overlap window, a delivery carries
+    // one v1 per secret, the current secret's first: t=<unix>,v1=<current>,v1=<previous>.
+    const current = 'whsec_current';
+    const previous = 'whsec_previous';
+    const rawBody = '{"job_id":"j-1","status":"done","test":false}';
+    const now = () => String(Math.floor(Date.now() / 1000));
+    const sign = (secret: string, t: string) => createHmac('sha256', secret).update(`${t}.${rawBody}`).digest('hex');
+    const verify = (signature: string, secret: string, timestamp = now()) =>
+      PdfikClient.verifyWebhookSignature(
+        rawBody,
+        { 'x-pdfik-signature': signature, 'x-pdfik-timestamp': timestamp },
+        secret
+      );
+
+    test('a single v1 verifies with its own secret and with no other', () => {
+      const t = now();
+      expect(verify(`t=${t},v1=${sign(current, t)}`, current)).toBe(true);
+      expect(verify(`t=${t},v1=${sign(current, t)}`, previous)).toBe(false);
+    });
+
+    test('two v1 values: a receiver on the current secret matches the first', () => {
+      // The helper used to read only the last v1 (the previous secret's), so a
+      // receiver already switched to the new secret rejected every delivery.
+      const t = now();
+      expect(verify(`t=${t},v1=${sign(current, t)},v1=${sign(previous, t)}`, current)).toBe(true);
+    });
+
+    test('two v1 values: a receiver still on the previous secret matches the second', () => {
+      const t = now();
+      expect(verify(`t=${t},v1=${sign(current, t)},v1=${sign(previous, t)}`, previous)).toBe(true);
+    });
+
+    test('two v1 values that match neither secret are rejected', () => {
+      const t = now();
+      expect(verify(`t=${t},v1=${sign(current, t)},v1=${sign(previous, t)}`, 'whsec_unrelated')).toBe(false);
+    });
+
+    test('the ±300 s window applies whichever v1 matches', () => {
+      const t = String(Math.floor(Date.now() / 1000) - 400);
+      expect(verify(`t=${t},v1=${sign(current, t)},v1=${sign(previous, t)}`, current, t)).toBe(false);
+      expect(verify(`t=${t},v1=${sign(current, t)},v1=${sign(previous, t)}`, previous, t)).toBe(false);
+    });
+
+    test('malformed signature headers are rejected', () => {
+      const t = now();
+      const malformed = [
+        `v1=${sign(current, t)},v1=${sign(previous, t)}`, // no t
+        `t=${t}`, // no v1
+        `t=${t},v1=,v1=`, // empty v1 values
+        'garbage',
+        // Signed, but t is not a number: outside every window (this used to pass).
+        `t=soon,v1=${sign(current, 'soon')}`,
+      ];
+      for (const signature of malformed) {
+        expect(verify(signature, current)).toBe(false);
+      }
+    });
+
+    test('header names match in any case', () => {
+      // A map that keeps the spelling it received, re-cased on the way: Go's
+      // canonical form behind a Go reverse proxy, or all capitals.
+      const t = now();
+      const signature = `t=${t},v1=${sign(current, t)},v1=${sign(previous, t)}`;
+      for (const [s, ts] of [
+        ['X-Pdfik-Signature', 'X-Pdfik-Timestamp'],
+        ['X-PDFIK-SIGNATURE', 'X-PDFIK-TIMESTAMP'],
+      ]) {
+        expect(PdfikClient.verifyWebhookSignature(rawBody, { [s]: signature, [ts]: t }, previous)).toBe(true);
+        expect(PdfikClient.verifyWebhookSignature(rawBody, { [s]: signature, [ts]: t }, 'whsec_unrelated')).toBe(false);
+      }
+    });
+
+    test('headers that are null, undefined or not an object are rejected, not thrown', () => {
+      for (const headers of [null, undefined, 'x-pdfik-signature']) {
+        expect(PdfikClient.verifyWebhookSignature(rawBody, headers as any, current)).toBe(false);
+      }
+    });
   });
 });
