@@ -90,7 +90,11 @@ function isCase(error: PdfikError, slug: string): boolean {
 function isThrottled(error: PdfikError): boolean {
   return (
     error.statusCode === 429 &&
-    (isCase(error, 'rate-limit-exceeded') || isCase(error, 'concurrency-limit-exceeded'))
+    (isCase(error, 'rate-limit-exceeded') ||
+      isCase(error, 'concurrency-limit-exceeded') ||
+      // The volume quota HELD by jobs still running clears by itself and says when
+      // (retry_after_seconds); a used-up volume quota carries no such field.
+      (isCase(error, 'quota-bytes-exceeded') && problemBody(error).retry_after_seconds !== undefined))
   );
 }
 
@@ -166,10 +170,19 @@ function failureText(value: unknown): string {
  * from (url, init), which throws a TypeError for a header value with CR/LF or a
  * character above U+00FF (a caller's `idempotencyKey`). Built here, outside the
  * try, that TypeError surfaces unchanged and is never resent. */
+// One request may not hang for ever: 90 s covers the synchronous mode's 60 s wait.
+const REQUEST_TIMEOUT_MS = 90000;
+
 async function send(url: string, init: RequestInit): Promise<Response | PdfikError> {
-  new Request(url, init);
+  const timed: RequestInit =
+    init.signal || typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function'
+      ? init
+      : { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
+  // A header fetch cannot send (an Idempotency-Key with a line break) is the caller's
+  // mistake: thrown at once, not turned into a resent NETWORK_ERROR.
+  if (typeof Request !== 'undefined') new Request(url, init);
   try {
-    return await fetch(url, init);
+    return await fetch(url, timed);
   } catch (failure) {
     return networkError(failure);
   }
@@ -229,7 +242,9 @@ export class PdfikClient {
     // that is resent twice. `new URL` alone accepts 'localhost:8000' (scheme "localhost:").
     let protocol = '';
     try {
-      protocol = new URL(this.baseUrl).protocol;
+      // In a browser a relative baseUrl (a same-origin proxy such as '/pdfik') is fine.
+      const page = typeof location !== 'undefined' && location && location.href ? location.href : undefined;
+      protocol = new URL(this.baseUrl, page).protocol;
     } catch {
       // not an absolute URL
     }
@@ -773,7 +788,8 @@ export class PdfikClient {
         if (Date.now() - startTime >= timeoutMs) {
           throw new PdfikError(`Job ${jobId} timed out`, 408, 'TIMEOUT');
         }
-        await new Promise((resolve) => setTimeout(resolve, throttleDelayMs(error, pollIntervalMs)));
+        const left = timeoutMs - (Date.now() - startTime);
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(throttleDelayMs(error, pollIntervalMs), left))));
         continue;
       }
       if (job.status === 'done' || job.status === 'failed') {
@@ -817,7 +833,9 @@ export class PdfikClient {
    * download attempt). `429` download-attempts-exhausted is thrown at once.
    */
   async downloadPdf(jobId: string): Promise<Uint8Array> {
-    return this.request(`/jobs/${jobId}/download`, 'GET', readBytes, undefined, undefined, isDownloadThrottled);
+    // Not resent on a broken connection or a 5xx: every started stream is one of the
+    // file's three download attempts, so one call must not spend them all.
+    return this.request(`/jobs/${jobId}/download`, 'GET', readBytes, undefined, undefined, isDownloadThrottled, false);
   }
 
   /**
@@ -848,7 +866,7 @@ export class PdfikClient {
     const signatureHeader = header('x-pdfik-signature');
     const timestampHeader = header('x-pdfik-timestamp');
 
-    if (!signatureHeader || !timestampHeader) {
+    if (!signatureHeader || !timestampHeader || typeof webhookSecret !== 'string' || !webhookSecret) {
       return false;
     }
 
@@ -864,7 +882,7 @@ export class PdfikClient {
         else if (key === 'v1' && value) receivedSigs.push(value);
       }
 
-      if (!timestamp || receivedSigs.length === 0) {
+      if (!timestamp || !/^[0-9]{1,20}$/.test(timestamp) || receivedSigs.length === 0) {
         return false;
       }
 

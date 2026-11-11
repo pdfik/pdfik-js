@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-10).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-11).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.

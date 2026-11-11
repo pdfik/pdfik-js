@@ -5,6 +5,7 @@ import { PdfikError } from '../src/errors';
 
 describe('PdfikClient', () => {
   let mockFetch: jest.Mock;
+  let sentSignals: unknown[] = [];
   // The Idempotency-Key of every request, read at the moment it is sent. The
   // mock keeps the request object by reference, so a key rewritten between two
   // attempts would look identical in mock.calls afterwards.
@@ -13,9 +14,14 @@ describe('PdfikClient', () => {
   beforeEach(() => {
     mockFetch = jest.fn();
     sentKeys = [];
-    global.fetch = ((url: string, init: { headers: Record<string, string> }) => {
+    sentSignals = [];
+    global.fetch = ((url: string, init: { headers: Record<string, string>; signal?: unknown }) => {
       sentKeys.push(init.headers['Idempotency-Key']);
-      return mockFetch(url, init);
+      // Every request carries a timeout signal (asserted on its own below); the call
+      // assertions compare the rest of the init.
+      sentSignals.push(init.signal);
+      const { signal, ...rest } = init;
+      return mockFetch(url, rest);
     }) as any;
   });
 
@@ -1179,7 +1185,7 @@ describe('PdfikClient', () => {
   // headers arrived: TypeError 'terminated', the socket's reason on `cause`.
   const bodyBrokeOff = () => Object.assign(new TypeError('terminated'), { cause: new Error('other side closed') });
 
-  test('a download whose body breaks off is a NETWORK_ERROR PdfikError, retried like a 5xx', async () => {
+  test('a download whose body breaks off is a NETWORK_ERROR PdfikError, NOT resent (each stream is one of three attempts)', async () => {
     const client = new PdfikClient({ apiKey: 'sk_test_123' });
     mockFetch.mockResolvedValue({
       ok: true,
@@ -1197,8 +1203,8 @@ describe('PdfikClient', () => {
       errorCode: 'NETWORK_ERROR',
       message: 'Connection failed: terminated',
     });
-    expect(sleeps).toEqual([1000, 2000]);
-    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(sleeps).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
   test('a JSON answer whose body breaks off is a NETWORK_ERROR PdfikError, retried like a 5xx', async () => {
@@ -1845,6 +1851,55 @@ describe('PdfikClient', () => {
       for (const headers of [null, undefined, 'x-pdfik-signature']) {
         expect(PdfikClient.verifyWebhookSignature(rawBody, headers as any, current)).toBe(false);
       }
+    });
+  });
+  describe('fixes of 2026-11-10', () => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    test('every request carries a timeout signal', async () => {
+      mockFetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ job_id: 'j', status: 'queued' }) });
+      await client.getJob('j');
+      expect(sentSignals[0]).toBeInstanceOf(AbortSignal);
+    });
+
+    test('the volume quota held by running jobs is waited out; a used-up one is not', async () => {
+      const held = problem(429, {
+        type: 'https://docs.pdfik.net/error-codes#quota-bytes-exceeded',
+        error: 'BYTE_QUOTA_EXCEEDED',
+        reserved: 157286400,
+        retry_after_seconds: 5,
+      }, { 'Retry-After': '5' });
+      mockFetch.mockResolvedValueOnce(held).mockResolvedValueOnce({
+        ok: true, status: 202, json: async () => ({ job_id: 'j2', status: 'queued' }),
+      });
+      const sleeps = recordSleeps();
+      const job = await client.urlToPdf('https://example.com');
+      expect(job.jobId).toBe('j2');
+      expect(sleeps).toEqual([5000]);
+    });
+
+    test('a broken download is not resent: each stream is one of three attempts', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+      recordSleeps();
+      await expect(client.downloadPdf('j')).rejects.toMatchObject({ errorCode: 'NETWORK_ERROR' });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    test('an empty secret never verifies a delivery', () => {
+      const crypto = require('crypto');
+      const t = String(Math.floor(Date.now() / 1000));
+      const body = '{"job_id":"j"}';
+      const v1 = crypto.createHmac('sha256', '').update(`${t}.${body}`).digest('hex');
+      const headers = { 'x-pdfik-signature': `t=${t},v1=${v1}`, 'x-pdfik-timestamp': t };
+      expect(PdfikClient.verifyWebhookSignature(body, headers, '')).toBe(false);
+    });
+
+    test('a timestamp that is not plain digits never verifies', () => {
+      const crypto = require('crypto');
+      const t = String(Math.floor(Date.now() / 1000));
+      const body = '{"job_id":"j"}';
+      const odd = `0x${Number(t).toString(16)}`;
+      const v1 = crypto.createHmac('sha256', 's').update(`${odd}.${body}`).digest('hex');
+      expect(PdfikClient.verifyWebhookSignature(body, { 'x-pdfik-signature': `t=${odd},v1=${v1}`, 'x-pdfik-timestamp': odd }, 's')).toBe(false);
     });
   });
 });

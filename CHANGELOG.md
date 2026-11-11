@@ -4,6 +4,20 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026-11-10
+
+### Fixed
+- `verifyWebhookSignature` returns `false` for an empty secret (an HMAC with an empty key
+  is public, so it verified a forged request) and for a `t` that is not plain digits.
+- Every request has a 90-second timeout; a hung connection used to block the call for ever.
+- `downloadPdf` is not resent after a broken connection or a 5xx: each started stream is
+  one of the file's three download attempts, and one call could spend all three.
+- The `429` volume quota held by jobs that are still running (it carries
+  `retry_after_seconds`) is waited out like the request-rate throttle; a used-up volume
+  quota is still thrown at once.
+- `waitForJob` no longer overshoots its `timeoutMs` while waiting out a `429`.
+- A relative `baseUrl` (a same-origin proxy) is accepted again in a browser.
+
 ## [0.7.0] — 2026-11-09
 
 ### Fixed
