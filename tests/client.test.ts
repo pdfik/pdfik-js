@@ -1229,6 +1229,55 @@ describe('PdfikClient', () => {
     expect(mockFetch).toHaveBeenCalledTimes(3);
   });
 
+  // The runtime's own error stays reachable on `cause` — the Java (getCause), C#
+  // (InnerException) and Python (__context__) clients keep it too. Without it a
+  // customer sees "Connection failed" and cannot tell ENOTFOUND from a TLS failure
+  // by code, only by parsing the message.
+  test.each([
+    ['no HTTP answer at all', 'getJob', () => mockFetch.mockRejectedValue(fetchFailed())],
+    [
+      'a JSON body that breaks off',
+      'getJob',
+      () =>
+        mockFetch.mockResolvedValue({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          json: () => Promise.reject(bodyBrokeOff()),
+        }),
+    ],
+    [
+      'a download body that breaks off',
+      'downloadPdf',
+      () =>
+        mockFetch.mockResolvedValue({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          arrayBuffer: () => Promise.reject(bodyBrokeOff()),
+        }),
+    ],
+  ])('a NETWORK_ERROR after %s keeps the runtime error on cause', async (_case, method, arrange) => {
+    const client = new PdfikClient({ apiKey: 'sk_test_123' });
+    arrange();
+    recordSleeps();
+
+    const error = await (client as any)[method]('job-123').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(PdfikError);
+    expect(error.errorCode).toBe('NETWORK_ERROR');
+    const cause = error.cause as { name?: string; message?: string; cause?: { message?: string } };
+    expect(cause).toBeDefined();
+    expect(cause.name).toBe('TypeError');
+    expect(['fetch failed', 'terminated']).toContain(cause.message);
+    // The low-level reason Node keeps one level further down stays where it was.
+    expect(cause.cause?.message).toMatch(/ECONNREFUSED|other side closed/);
+    // Set like `new Error(msg, { cause })` does: an own, non-enumerable property, so
+    // JSON.stringify and console output of the error are unchanged.
+    expect(Object.getOwnPropertyDescriptor(error, 'cause')?.enumerable).toBe(false);
+    expect(Object.keys(error)).not.toContain('cause');
+  });
+
   test('a complete 200 whose body is not JSON is an answer, not a NETWORK_ERROR: no resend, the SyntaxError surfaces', async () => {
     // The body arrived whole; sending the request again would only fetch the same bytes.
     const client = new PdfikClient({ apiKey: 'sk_test_123' });

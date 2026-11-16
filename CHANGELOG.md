@@ -4,6 +4,14 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] — 2026-11-16
+
+### Added
+- A `NETWORK_ERROR` `PdfikError` keeps the runtime's own error on `cause` (the
+  `TypeError: fetch failed` with Node's reason such as `ECONNREFUSED` on its own `cause`,
+  a timeout's `TimeoutError`, the error a broken body read ended with), as the Java, C# and
+  Python clients already do. Status, code, message and retries are unchanged.
+
 ## [0.7.1] — 2026-11-10
 
 ### Fixed

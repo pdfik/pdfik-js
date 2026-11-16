@@ -143,7 +143,13 @@ function networkError(failure: unknown): PdfikError {
   // several A records) an AggregateError whose own message is EMPTY and whose
   // `errors` hold one reason per address tried.
   const why = failure !== null && typeof failure === 'object' ? failureText((failure as { cause?: unknown }).cause) : '';
-  return new PdfikError(`Connection failed: ${why ? `${reason} (${why})` : reason}`, 503, 'NETWORK_ERROR');
+  const error = new PdfikError(`Connection failed: ${why ? `${reason} (${why})` : reason}`, 503, 'NETWORK_ERROR');
+  // The runtime's own error stays reachable on `cause`, as the Java (getCause), C#
+  // (InnerException) and Python (__context__) clients keep it: an own, non-enumerable
+  // property, exactly how `new Error(msg, { cause })` sets it (that constructor
+  // option is ES2022; this package targets ES2020).
+  Object.defineProperty(error, 'cause', { value: failure, writable: true, configurable: true, enumerable: false });
+  return error;
 }
 
 /** The text of an error-like value: its message; else the messages its `errors`
