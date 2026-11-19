@@ -143,3 +143,32 @@ export interface JobFileResponse {
   downloadUrl: string;
   expiresInSeconds: number;
 }
+
+/** `GET /account`: the key's account — plan, current quota window, usage and limits. */
+export interface AccountResponse {
+  /** free, starter, pro or business */
+  plan: string;
+  /**
+   * The quota window limits are counted in (RFC 3339, UTC): the calendar month on the
+   * Free plan; on paid plans monthly from the subscription's billing day.
+   */
+  window: { start: string; end: string };
+  usage: {
+    /** Documents charged in this window (new jobs are refused at limits.documents); null if unknown right now */
+    documents: number | null;
+    /** Bytes of generated output finished in this window */
+    bytes: number;
+  };
+  limits: {
+    /** Documents per window; null means unlimited */
+    documents: number | null;
+    /** Bytes of generated output per window; null means unlimited */
+    bytes: number | null;
+    requestsPerMinute: number;
+    concurrentJobs: number;
+    maxFileSizeBytes: number;
+  };
+  testMode: { perMinute: number; perDay: number };
+  /** The key's name in the dashboard; null if it has none */
+  key: { name: string | null };
+}

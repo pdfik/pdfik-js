@@ -135,6 +135,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -175,6 +176,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -211,6 +213,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -239,6 +242,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': 'md-key-1',
         'Content-Type': 'application/json',
       },
@@ -276,6 +280,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -339,6 +344,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -431,6 +437,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -472,6 +479,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -509,6 +517,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -568,6 +577,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -601,6 +611,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': 'einv-key-1',
         'Content-Type': 'application/json',
       },
@@ -678,6 +689,7 @@ describe('PdfikClient', () => {
       method: 'POST',
       headers: {
         'X-API-Key': 'sk_test_123',
+        'X-PDFik-Client': 'sdk-js/0.8.0',
         'Idempotency-Key': generatedKey,
         'Content-Type': 'application/json',
       },
@@ -1535,7 +1547,7 @@ describe('PdfikClient', () => {
     ]);
     expect(sentKeys).toEqual([undefined, undefined, undefined]);
     for (const [, init] of mockFetch.mock.calls) {
-      expect(init.headers).toEqual({ 'X-API-Key': 'sk_test_123' });
+      expect(init.headers).toEqual({ 'X-API-Key': 'sk_test_123', 'X-PDFik-Client': 'sdk-js/0.8.0' });
     }
   });
 
@@ -1949,6 +1961,62 @@ describe('PdfikClient', () => {
       const odd = `0x${Number(t).toString(16)}`;
       const v1 = crypto.createHmac('sha256', 's').update(`${odd}.${body}`).digest('hex');
       expect(PdfikClient.verifyWebhookSignature(body, { 'x-pdfik-signature': `t=${odd},v1=${v1}`, 'x-pdfik-timestamp': odd }, 's')).toBe(false);
+    });
+  });
+
+  describe('integrations release (0.8.0)', () => {
+    test('every request names this SDK in X-PDFik-Client', async () => {
+      const { SDK_VERSION, CLIENT_HEADER } = require('../src/version');
+      const pkg = require('../package.json');
+      expect(SDK_VERSION).toBe(pkg.version);
+      expect(CLIENT_HEADER).toBe(`sdk-js/${pkg.version}`);
+
+      const client = new PdfikClient({ apiKey: 'sk_test_123' });
+      mockFetch.mockResolvedValue({ ok: true, json: async () => ({ status: 'done' }) });
+      await client.getJob('job-123');
+      expect(mockFetch.mock.calls[0][1].headers['X-PDFik-Client']).toBe(`sdk-js/${pkg.version}`);
+    });
+
+    test('getAccount reads GET /account, creates nothing and maps the fields to camelCase', async () => {
+      const client = new PdfikClient({ apiKey: 'sk_test_123' });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          plan: 'pro',
+          window: { start: '2026-11-05T00:00:00Z', end: '2026-12-05T00:00:00Z' },
+          usage: { documents: 1234, bytes: 52428800 },
+          limits: { documents: 50000, bytes: 53687091200, requests_per_minute: 500, concurrent_jobs: 50, max_file_size_bytes: 157286400 },
+          test_mode: { per_minute: 60, per_day: 2000 },
+          key: { name: null },
+        }),
+      });
+
+      const account = await client.getAccount();
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const [url, init] = mockFetch.mock.calls[0];
+      expect(url).toBe('https://api.pdfik.net/account');
+      expect(init.method).toBe('GET');
+      expect(init.body).toBeUndefined();
+      expect(sentKeys).toEqual([undefined]);
+      expect(account).toEqual({
+        plan: 'pro',
+        window: { start: '2026-11-05T00:00:00Z', end: '2026-12-05T00:00:00Z' },
+        usage: { documents: 1234, bytes: 52428800 },
+        limits: { documents: 50000, bytes: 53687091200, requestsPerMinute: 500, concurrentJobs: 50, maxFileSizeBytes: 157286400 },
+        testMode: { perMinute: 60, perDay: 2000 },
+        key: { name: null },
+      });
+    });
+
+    test('getAccount surfaces a rejected key as PdfikError 401', async () => {
+      const client = new PdfikClient({ apiKey: 'sk_test_123' });
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        text: async () => JSON.stringify({ type: 'https://docs.pdfik.net/error-codes#401', title: 'Invalid API key', status: 401, detail: 'Invalid API key' }),
+      });
+      await expect(client.getAccount()).rejects.toMatchObject({ statusCode: 401 });
     });
   });
 });

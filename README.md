@@ -1,6 +1,6 @@
 # @pdfik/client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-16).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-19).
 > Releases to npm are cut from the monorepo; issues and PRs are welcome here.
 
 Official JavaScript/TypeScript SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -138,6 +138,17 @@ Get the direct API download URL for the generated PDF (requires the "X-API-Key" 
 ```typescript
 const { downloadUrl } = await client.getFileUrl(job.jobId);
 console.log(`Direct Download URL: ${downloadUrl}`);
+```
+
+### Check your key and usage
+
+`getAccount()` returns the plan, the current quota window, what has been used in it and the limits — without creating a job or charging anything:
+
+```typescript
+const account = await client.getAccount();
+console.log(account.plan);                                  // e.g. "free"
+console.log(account.usage.documents, account.limits.documents); // used / allowed this window
+console.log(account.window.end);                            // when the window resets
 ```
 
 ### Test mode
@@ -336,6 +347,7 @@ The constructor throws a `TypeError` when `baseUrl` is not an absolute http(s) U
 - **`htmlToImage(html, opts)`**: Submits a job to capture raw HTML markup as a PNG/JPEG screenshot. Returns a `JobCreatedResponse`.
 - **`einvoiceToPdf(xml, opts)`**: Submits a Factur-X e-invoice job — builds the human-readable invoice from your CII XML with a block template, renders to PDF/A-3 and embeds the XML as `factur-x.xml`. Returns a `JobCreatedResponse`.
 - **`urlToPdfFile(url, opts)` / `htmlToPdfFile(html, opts)` / `markdownToPdfFile(markdown, opts)` / `urlToImageFile(url, opts)` / `htmlToImageFile(html, opts)` / `einvoiceToPdfFile(xml, opts)`**: Synchronous variants of the six methods above — send the same request with `wait: true` and return the output file itself as a `Uint8Array` (the PDF, or PNG/JPEG bytes for the image methods); the server holds the request for up to ~45 s. Same `opts` as the corresponding method, minus `delivery`. On timeout they throw a `PdfikError` with `errorCode: 'SYNC_TIMEOUT'` (HTTP `503` — the job was cancelled and not charged; never resent by the SDK), and a failed render throws the job's own error code (HTTP `422`).
+- **`getAccount()`**: The key's account — plan, current quota window, usage in it and limits. Creates nothing, charges nothing. Returns an `AccountResponse`.
 - **`getJob(jobId)`**: Fetches the status of a specific job. Returns a `JobStatusResponse`.
 - **`waitForJob(jobId, opts)`**: Helper that polls `getJob` until the job is `done` or `failed`. Throws a `PdfikError` if the job fails or times out.
   - `opts.timeoutMs` (default: `120000` ms)

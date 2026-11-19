@@ -11,7 +11,9 @@ import {
   EInvoiceProfile,
   ImageOptions,
   DeliveryOptions,
+  AccountResponse,
 } from './types';
+import { CLIENT_HEADER } from './version';
 
 function snakeToCamel(str: string): string {
   return str.replace(/([-_][a-z])/g, (group) =>
@@ -284,6 +286,8 @@ export class PdfikClient {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
       'X-API-Key': this.apiKey,
+      // Tells the API which client sent the request (closed set server-side; never rejected).
+      'X-PDFik-Client': CLIENT_HEADER,
       ...extraHeaders,
     };
 
@@ -763,6 +767,15 @@ export class PdfikClient {
       test: opts?.test,
     };
     return this.requestFile('/einvoice-to-pdf', body, opts?.idempotencyKey);
+  }
+
+  /**
+   * The plan, current quota window, usage in it and limits of the account this key
+   * belongs to. Creates no job and charges nothing — useful to check that a key works.
+   */
+  async getAccount(): Promise<AccountResponse> {
+    const data = await this.request('/account', 'GET', readJson);
+    return mapKeys(data, snakeToCamel) as AccountResponse;
   }
 
   async getJob(jobId: string): Promise<JobStatusResponse> {

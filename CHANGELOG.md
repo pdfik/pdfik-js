@@ -4,6 +4,15 @@ All notable changes to `@pdfik/client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-11-19
+
+### Added
+- `getAccount()` — `GET /account`: the key's plan, current quota window, usage in it and
+  limits (`AccountResponse`). Creates no job and charges nothing; useful to check a key.
+- Every request sends `X-PDFik-Client: sdk-js/<version>` so usage can be attributed to
+  this SDK. In a browser that is a custom header: a cross-origin proxy of your own that lists
+  `Access-Control-Allow-Headers` explicitly must add `X-PDFik-Client` to that list.
+
 ## [0.7.2] — 2026-11-16
 
 ### Added
